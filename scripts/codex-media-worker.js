@@ -10,7 +10,9 @@ const projectRoot = path.resolve(__dirname, "..");
 const lifeBaseUrl = (process.env.LIFE_BASE_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
 const publicLifeBaseUrl = (process.env.CODEX_MEDIA_PUBLIC_LIFE_BASE_URL || lifeBaseUrl).replace(/\/$/, "");
 const pollMs = Number(process.env.CODEX_MEDIA_POLL_MS || 10000);
+const deletePollMs = Number(process.env.CODEX_MEDIA_DELETE_POLL_MS || 5000);
 const once = process.argv.includes("--once");
+const noDeleteSweeper = process.argv.includes("--no-delete-sweeper");
 const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
 const ffmpegCommand = process.env.FFMPEG_COMMAND || resolveFfmpegCommand();
 const codexTimeoutMs = Number(process.env.CODEX_MEDIA_CODEX_TIMEOUT_MS || 20 * 60 * 1000);
@@ -24,8 +26,20 @@ await fs.mkdir(outputRoot, { recursive: true });
 
 log(`Codex media worker started. life=${lifeBaseUrl} codex=${codexCommand}`);
 
+let deleteSweepBusy = false;
+if (!once && !noDeleteSweeper) {
+  setInterval(() => {
+    sweepDeleteRequestedJob().catch((error) => {
+      log(`Delete sweeper error: ${errorMessage(error)}`);
+    });
+  }, deletePollMs);
+}
+
 do {
   try {
+    if (await sweepDeleteRequestedJob()) {
+      continue;
+    }
     const job = await takePendingJob();
     if (job) {
       await processJob(job);
@@ -46,6 +60,36 @@ async function takePendingJob() {
   if (!job) return null;
   await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(job.request_id)}/running`, {});
   return job;
+}
+
+async function takeDeleteRequestedJob() {
+  const data = await getJson(`${lifeBaseUrl}/api/codex-media/jobs?status=delete_requested&limit=1`);
+  return data.jobs?.[0] || null;
+}
+
+async function sweepDeleteRequestedJob() {
+  if (deleteSweepBusy) return false;
+  deleteSweepBusy = true;
+  try {
+    const deleteJob = await takeDeleteRequestedJob();
+    if (!deleteJob) return false;
+    await processDeleteJob(deleteJob);
+    return true;
+  } finally {
+    deleteSweepBusy = false;
+  }
+}
+
+async function processDeleteJob(job) {
+  const requestId = job.request_id;
+  const targets = resolveDeleteTargets(job);
+  for (const target of targets) {
+    await removeLocalOutputDir(target);
+  }
+  await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(requestId)}/deleted`, {
+    deletedLocalPaths: targets
+  });
+  log(`Deleted local files for ${requestId}: ${targets.join(", ") || "none"}`);
 }
 
 async function processJob(job) {
@@ -345,6 +389,41 @@ async function uploadAssetsToLife(assets) {
     }
   }
   return uploaded;
+}
+
+function resolveDeleteTargets(job) {
+  const requestId = safeSegment(job?.request_id || "");
+  const targets = new Set();
+  const result = parseJson(job?.result_json);
+  const outputDir = result.outputDir || result.output_dir || "";
+  if (outputDir) {
+    targets.add(path.resolve(outputDir));
+  }
+  if (requestId) {
+    targets.add(path.resolve(outputRoot, requestId));
+  }
+  if (Array.isArray(result.assets)) {
+    for (const asset of result.assets) {
+      const assetPath = asset?.path ? path.resolve(String(asset.path)) : "";
+      if (assetPath && isWithinOutputRoot(assetPath)) {
+        targets.add(path.dirname(assetPath));
+      }
+    }
+  }
+  return Array.from(targets).filter(isWithinOutputRoot);
+}
+
+async function removeLocalOutputDir(target) {
+  if (!target || !isWithinOutputRoot(target)) {
+    throw new Error("Refusing to delete path outside output root: " + target);
+  }
+  await fs.rm(target, { recursive: true, force: true });
+}
+
+function isWithinOutputRoot(target) {
+  const root = path.resolve(outputRoot);
+  const resolved = path.resolve(target || "");
+  return resolved === root || resolved.startsWith(root + path.sep);
 }
 
 async function getJson(url) {
