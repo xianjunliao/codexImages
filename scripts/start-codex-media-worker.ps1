@@ -24,6 +24,12 @@ while ($true) {
         $env:CODEX_MEDIA_POLL_MS = if ($env:CODEX_MEDIA_POLL_MS) { $env:CODEX_MEDIA_POLL_MS } else { "10000" }
         $env:CODEX_MEDIA_UPLOAD_TO_LIFE = if ($env:CODEX_MEDIA_UPLOAD_TO_LIFE) { $env:CODEX_MEDIA_UPLOAD_TO_LIFE } else { "true" }
         $env:CODEX_MEDIA_OUTPUT_DIR = if ($env:CODEX_MEDIA_OUTPUT_DIR) { $env:CODEX_MEDIA_OUTPUT_DIR } else { Join-Path $ProjectRoot "generated\codex-media" }
+        if (-not $env:FFMPEG_COMMAND) {
+            $localFfmpeg = Join-Path $ProjectRoot "tools\ffmpeg\bin\ffmpeg.exe"
+            if (Test-Path $localFfmpeg) {
+                $env:FFMPEG_COMMAND = $localFfmpeg
+            }
+        }
         if (-not $env:CODEX_COMMAND) {
             $codexCommand = Get-Command codex.cmd -ErrorAction SilentlyContinue
             if ($codexCommand) {

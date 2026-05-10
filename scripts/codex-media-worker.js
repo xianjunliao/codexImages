@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -12,6 +12,7 @@ const publicLifeBaseUrl = (process.env.CODEX_MEDIA_PUBLIC_LIFE_BASE_URL || lifeB
 const pollMs = Number(process.env.CODEX_MEDIA_POLL_MS || 10000);
 const once = process.argv.includes("--once");
 const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
+const ffmpegCommand = process.env.FFMPEG_COMMAND || resolveFfmpegCommand();
 const codexTimeoutMs = Number(process.env.CODEX_MEDIA_CODEX_TIMEOUT_MS || 20 * 60 * 1000);
 const outputRoot = process.env.CODEX_MEDIA_OUTPUT_DIR ||
   path.join(projectRoot, "generated", "codex-media");
@@ -89,6 +90,8 @@ async function processJobInner(job) {
     return;
   }
 
+  assets = await maybeComposeVideo(job, jobOutputDir, assets);
+
   if (uploadToLife) {
     assets = await uploadAssetsToLife(assets);
   }
@@ -103,6 +106,11 @@ async function processJobInner(job) {
 
 function buildCodexPrompt(job, outputDir) {
   const options = parseJson(job.options_json);
+  const wantsVideo = isVideoMode(job.mode);
+  const videoSeconds = parseVideoSeconds(job, options);
+  const videoFrameCount = wantsVideo
+    ? Math.max(Number(job.image_count || 1), Math.round(videoSeconds * 8))
+    : Number(job.image_count || 1);
   return [
     "You are a local automated media generation worker for the life project.",
     "Generate the requested image or video assets, then save the final files into the exact output directory below.",
@@ -113,6 +121,7 @@ function buildCodexPrompt(job, outputDir) {
     "3. Do not claim success if no file was written. Explain the reason clearly instead.",
     "4. For continuous images, keep subject identity, scene language, camera language, and color logic consistent while changing motion, light, or composition gradually.",
     "5. Your final message must be a short JSON summary with assets and notes.",
+    wantsVideo ? "6. For video mode, generate an ordered image sequence suitable for a short motion clip. Save frames as frame-0001.png, frame-0002.png, and so on. The worker will compose the MP4 after you finish." : "",
     "",
     "Prompt handling:",
     "1. Preserve the user's visual intent as faithfully as possible. Do not add new character traits, camera angles, clothing, props, or story elements unless required for safety or basic coherence.",
@@ -124,7 +133,9 @@ function buildCodexPrompt(job, outputDir) {
     `Output directory: ${outputDir}`,
     `Task ID: ${job.request_id}`,
     `Mode: ${job.mode || "images"}`,
-    `Image count: ${job.image_count || 1}`,
+    `Image count: ${videoFrameCount}`,
+    wantsVideo ? `Target video duration: ${videoSeconds} seconds` : "",
+    wantsVideo ? "Frame sequence guidance: create small, gradual motion changes between neighboring frames; avoid sudden changes in identity, pose, clothing, background, or lighting." : "",
     `Aspect ratio: ${options.aspect || ""}`,
     `Style: ${options.style || ""}`,
     `Continuity requirements: ${options.continuity || ""}`,
@@ -132,6 +143,61 @@ function buildCodexPrompt(job, outputDir) {
     "User prompt:",
     job.prompt || ""
   ].join("\n");
+}
+
+async function maybeComposeVideo(job, jobOutputDir, assets) {
+  if (!isVideoMode(job.mode)) return assets;
+  if (assets.some(asset => /\.mp4$/i.test(asset.fileName))) return assets;
+  const imageAssets = assets.filter(asset => /\.(png|jpe?g|webp)$/i.test(asset.fileName));
+  if (imageAssets.length < 2) {
+    throw new Error("视频模式至少需要 2 张连续帧图片，但当前只生成了 " + imageAssets.length + " 张。");
+  }
+  if (!ffmpegCommand) {
+    throw new Error("已生成连续帧，但这台机器没有可用的 ffmpeg，无法合成 mp4。请安装 ffmpeg 或设置 FFMPEG_COMMAND。连续帧目录：" + jobOutputDir);
+  }
+
+  const options = parseJson(job.options_json);
+  const seconds = parseVideoSeconds(job, options);
+  const fps = Math.max(1, Math.min(24, Math.round(imageAssets.length / seconds)));
+  const orderedFrames = imageAssets.slice().sort((a, b) => a.fileName.localeCompare(b.fileName));
+  const frameListFile = path.join(jobOutputDir, "ffmpeg-frames.txt");
+  const clipName = "clip-0001.mp4";
+  const clipPath = path.join(jobOutputDir, clipName);
+  const frameList = orderedFrames.map(asset => `file '${asset.path.replace(/'/g, "'\\''")}'`).join("\n");
+  await fs.writeFile(frameListFile, frameList + "\n", "utf8");
+
+  const result = await runProcess(ffmpegCommand, [
+    "-y",
+    "-r", String(fps),
+    "-f", "concat",
+    "-safe", "0",
+    "-i", frameListFile,
+    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+    "-movflags", "+faststart",
+    "-t", String(seconds),
+    clipPath
+  ], { cwd: jobOutputDir, timeoutMs: Number(process.env.CODEX_MEDIA_FFMPEG_TIMEOUT_MS || 5 * 60 * 1000) });
+
+  if (result.code !== 0 || !existsSync(clipPath)) {
+    throw new Error("ffmpeg 合成视频失败：" + trimText(result.stderr || result.stdout, 2000));
+  }
+
+  const stat = await fs.stat(clipPath);
+  const clipAsset = {
+    fileName: clipName,
+    path: clipPath,
+    size: stat.size,
+    url: buildLocalAssetUrl(jobOutputDir, clipName),
+    localUrl: buildLocalAssetUrl(jobOutputDir, clipName),
+    generatedFromFrames: orderedFrames.length,
+    durationSeconds: seconds,
+    fps
+  };
+
+  if (String(job.mode || "").toLowerCase() === "video") {
+    return [clipAsset];
+  }
+  return [...assets, clipAsset];
 }
 
 async function runCodex(promptFile, lastMessageFile) {
@@ -188,6 +254,42 @@ async function runCodex(promptFile, lastMessageFile) {
         child.stdin.write("Failed to read prompt: " + errorMessage(error));
         child.stdin.end();
       });
+  });
+}
+
+async function runProcess(command, args, options = {}) {
+  return new Promise((resolve) => {
+    let child;
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd || projectRoot,
+        windowsHide: true,
+        shell: /\.cmd$/i.test(command),
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (error) {
+      resolve({ code: 1, stdout, stderr: errorMessage(error) });
+      return;
+    }
+    const timeout = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {}
+      finish(1, `process timed out after ${Math.round((options.timeoutMs || 60000) / 1000)} seconds`);
+    }, options.timeoutMs || 60000);
+    const finish = (code, extraStderr = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ code, stdout, stderr: stderr + extraStderr });
+    };
+    child.stdout.on("data", chunk => { stdout += chunk.toString(); });
+    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    child.on("error", error => finish(1, errorMessage(error)));
+    child.on("close", code => finish(code));
   });
 }
 
@@ -294,6 +396,36 @@ function contentType(fileName) {
   return "application/octet-stream";
 }
 
+function isVideoMode(mode) {
+  const value = String(mode || "").toLowerCase();
+  return value === "video" || value === "both";
+}
+
+function parseVideoSeconds(job, options = {}) {
+  const candidates = [
+    options.duration,
+    options.durationSeconds,
+    options.seconds,
+    job.prompt
+  ].map(value => String(value || ""));
+  for (const value of candidates) {
+    const rangeMatch = value.match(/(\d+(?:\.\d+)?)\s*(?:~|-|到|至)\s*(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)?/i);
+    if (rangeMatch) {
+      return clampSeconds(Number(rangeMatch[2]));
+    }
+    const match = value.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)/i);
+    if (match) {
+      return clampSeconds(Number(match[1]));
+    }
+  }
+  return 3;
+}
+
+function clampSeconds(value) {
+  if (!Number.isFinite(value) || value <= 0) return 3;
+  return Math.max(1, Math.min(6, value));
+}
+
 function buildLocalAssetUrl(dir, fileName) {
   if (!publicOutputPrefix) {
     return "";
@@ -326,4 +458,22 @@ function resolveCodexCommand() {
     }
   }
   return "codex";
+}
+
+function resolveFfmpegCommand() {
+  const candidates = [
+    "ffmpeg",
+    "C:\\ffmpeg\\bin\\ffmpeg.exe",
+    "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+    "E:\\ffmpeg\\bin\\ffmpeg.exe"
+  ];
+  for (const candidate of candidates) {
+    if (candidate === "ffmpeg" && spawnSync(candidate, ["-version"], { windowsHide: true }).status === 0) {
+      return candidate;
+    }
+    if (candidate !== "ffmpeg" && existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return "";
 }
