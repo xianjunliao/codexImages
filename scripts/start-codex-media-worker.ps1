@@ -7,6 +7,7 @@ $ErrorActionPreference = "Continue"
 $logDir = Join-Path $ProjectRoot "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $logFile = Join-Path $logDir "codex-media-worker.log"
+$envFile = Join-Path $ProjectRoot ".env"
 
 function Write-WorkerLog {
     param([string]$Message)
@@ -15,6 +16,19 @@ function Write-WorkerLog {
 }
 
 Write-WorkerLog "Starting Codex Media worker loop. LifeBaseUrl=$LifeBaseUrl ProjectRoot=$ProjectRoot"
+
+if (Test-Path -LiteralPath $envFile) {
+    Get-Content -LiteralPath $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#") -and $line.Contains("=")) {
+            $name, $value = $line.Split("=", 2)
+            if ($name) {
+                [Environment]::SetEnvironmentVariable($name.Trim(), $value.Trim(), "Process")
+            }
+        }
+    }
+    Write-WorkerLog "Loaded worker environment from .env"
+}
 
 while ($true) {
     try {

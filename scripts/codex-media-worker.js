@@ -21,9 +21,13 @@ const outputRoot = process.env.CODEX_MEDIA_OUTPUT_DIR ||
 const publicOutputPrefix = process.env.CODEX_MEDIA_PUBLIC_PREFIX || "";
 const uploadToLife = String(process.env.CODEX_MEDIA_UPLOAD_TO_LIFE || "true").toLowerCase() !== "false";
 const uploadThemeName = process.env.CODEX_MEDIA_UPLOAD_THEME || "CodexMedia";
+const lifeAccessKey = (process.env.CODEX_MEDIA_ACCESS_KEY || "").trim();
+let lifeAccessToken = (process.env.CODEX_MEDIA_SESSION_TOKEN || process.env.LIFE_ACCESS_TOKEN || "").trim();
+const workerToken = (process.env.CODEX_MEDIA_WORKER_TOKEN || process.env.CODEX_CHAT_WORKER_TOKEN || "").trim();
 const defaultAspectRatio = "9:16";
 
 await fs.mkdir(outputRoot, { recursive: true });
+await ensureLifeAuth();
 
 log(`Codex media worker started. life=${lifeBaseUrl} codex=${codexCommand}`);
 
@@ -399,7 +403,7 @@ async function uploadAssetsToLife(assets) {
       const formData = new FormData();
       formData.append("file", new Blob([buffer], { type: contentType(asset.fileName) }), asset.fileName);
       const uploadUrl = `${lifeBaseUrl}/upload/to?themeName=${encodeURIComponent(uploadThemeName)}`;
-      const response = await fetch(uploadUrl, { method: "POST", body: formData });
+      const response = await fetch(uploadUrl, { method: "POST", headers: authHeaders(), body: formData });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || Number(data.status) !== 200) {
         throw new Error(data.message || `upload failed: ${response.status}`);
@@ -459,7 +463,7 @@ function isWithinOutputRoot(target) {
 }
 
 async function getJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: authHeaders() });
   const data = await response.json();
   if (!response.ok || data.success === false || data.ok === false) {
     throw new Error(data.error || data.msg || `GET failed: ${response.status}`);
@@ -470,7 +474,7 @@ async function getJson(url) {
 async function postJson(url, payload) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(payload || {})
   });
   const data = await response.json();
@@ -478,6 +482,34 @@ async function postJson(url, payload) {
     throw new Error(data.error || data.msg || `POST failed: ${response.status}`);
   }
   return data;
+}
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (lifeAccessToken) {
+    headers["X-Life-Access-Token"] = lifeAccessToken;
+  }
+  if (workerToken) {
+    headers["X-Codex-Chat-Token"] = workerToken;
+  }
+  return headers;
+}
+
+async function ensureLifeAuth() {
+  if (lifeAccessToken || !lifeAccessKey) return;
+  const response = await fetch(`${lifeBaseUrl}/api/access/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: lifeAccessKey })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.success === false) {
+    throw new Error(data.error || `access verify failed: ${response.status}`);
+  }
+  lifeAccessToken = String(data.auth?.accessToken || "").trim();
+  if (!lifeAccessToken) {
+    throw new Error("access verify succeeded but no session token was returned.");
+  }
 }
 
 function parseJson(raw) {
