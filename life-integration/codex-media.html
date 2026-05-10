@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Codex Media</title>
+    <link rel="icon" href="/lxj/img/favicon.ico" sizes="any">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg: #f4f7f5;
+            --panel: #ffffff;
+            --ink: #17211b;
+            --muted: #607068;
+            --line: #dbe5df;
+            --accent: #0f8a6a;
+            --shadow: 0 16px 38px rgba(30, 47, 38, 0.12);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, "Microsoft YaHei", sans-serif;
+            color: var(--ink);
+            background: var(--bg);
+        }
+
+        button,
+        input {
+            font: inherit;
+        }
+
+        .media-bridge {
+            min-height: 100vh;
+            display: grid;
+            grid-template-rows: auto 1fr;
+        }
+
+        .bridge-topbar {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 14px;
+            align-items: center;
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.92);
+            box-shadow: var(--shadow);
+        }
+
+        .icon-link,
+        .icon-button {
+            width: 42px;
+            height: 42px;
+            display: inline-grid;
+            place-items: center;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            color: var(--ink);
+            background: var(--panel);
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .bridge-title {
+            min-width: 0;
+        }
+
+        h1,
+        p {
+            margin: 0;
+        }
+
+        h1 {
+            font-size: 20px;
+        }
+
+        p {
+            color: var(--muted);
+            font-size: 13px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .bridge-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .base-url-input {
+            width: min(360px, 36vw);
+            height: 42px;
+            padding: 0 12px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+        }
+
+        .open-button {
+            height: 42px;
+            padding: 0 14px;
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            color: #fff;
+            background: var(--accent);
+            cursor: pointer;
+        }
+
+        .bridge-frame-wrap {
+            min-height: 0;
+            padding: 16px;
+        }
+
+        .bridge-frame {
+            width: 100%;
+            height: calc(100vh - 108px);
+            display: block;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: #fff;
+        }
+
+        .bridge-empty {
+            height: calc(100vh - 108px);
+            display: grid;
+            place-items: center;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: #fff;
+            color: var(--muted);
+            text-align: center;
+            padding: 24px;
+        }
+
+        @media (max-width: 780px) {
+            .bridge-topbar {
+                grid-template-columns: auto 1fr;
+            }
+
+            .bridge-controls {
+                grid-column: 1 / -1;
+            }
+
+            .base-url-input {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+<main class="media-bridge">
+    <header class="bridge-topbar">
+        <a class="icon-link" href="/lxj/index.html" title="返回">
+            <i class="fas fa-arrow-left"></i>
+        </a>
+        <div class="bridge-title">
+            <h1>Codex Media</h1>
+            <p id="bridgeStatus">连接本地生成工作流</p>
+        </div>
+        <div class="bridge-controls">
+            <input class="base-url-input" id="baseUrlInput" type="url" value="http://127.0.0.1:3027" aria-label="工作流地址">
+            <button class="icon-button" id="reloadButton" type="button" title="刷新">
+                <i class="fas fa-rotate-right"></i>
+            </button>
+            <button class="open-button" id="openButton" type="button">打开</button>
+        </div>
+    </header>
+    <section class="bridge-frame-wrap" id="frameWrap"></section>
+</main>
+
+<script>
+    (function () {
+        var storageKey = 'codexMediaWorkflowBaseUrl';
+        var baseUrlInput = document.getElementById('baseUrlInput');
+        var bridgeStatus = document.getElementById('bridgeStatus');
+        var frameWrap = document.getElementById('frameWrap');
+        var openButton = document.getElementById('openButton');
+        var reloadButton = document.getElementById('reloadButton');
+
+        baseUrlInput.value = localStorage.getItem(storageKey) || baseUrlInput.value;
+
+        function normalizeBaseUrl() {
+            return String(baseUrlInput.value || '').trim().replace(/\/+$/, '');
+        }
+
+        function renderFrame() {
+            var baseUrl = normalizeBaseUrl();
+            if (!baseUrl) {
+                frameWrap.innerHTML = '<div class="bridge-empty">请填写 Codex Media 工作流地址</div>';
+                return;
+            }
+            localStorage.setItem(storageKey, baseUrl);
+            frameWrap.innerHTML = '<iframe class="bridge-frame" title="Codex Media Workflow" src="' + escapeAttribute(baseUrl) + '"></iframe>';
+            checkHealth(baseUrl);
+        }
+
+        function checkHealth(baseUrl) {
+            bridgeStatus.textContent = '正在连接 ' + baseUrl;
+            fetch(baseUrl + '/api/health')
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    bridgeStatus.textContent = data.hasOpenAIKey ? '工作流已连接' : '工作流已连接，OPENAI_API_KEY 未配置';
+                })
+                .catch(function () {
+                    bridgeStatus.textContent = '未连接，请先启动 codexImages 工作流服务';
+                });
+        }
+
+        function escapeAttribute(value) {
+            return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        }
+
+        openButton.addEventListener('click', function () {
+            var baseUrl = normalizeBaseUrl();
+            if (baseUrl) {
+                localStorage.setItem(storageKey, baseUrl);
+                window.open(baseUrl, '_blank', 'noopener');
+            }
+        });
+
+        reloadButton.addEventListener('click', renderFrame);
+        baseUrlInput.addEventListener('change', renderFrame);
+        renderFrame();
+    })();
+</script>
+</body>
+</html>

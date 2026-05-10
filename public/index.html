@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex Media</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<main class="app-shell">
+  <section class="control-panel">
+    <header class="topbar">
+      <div>
+        <h1>Codex Media</h1>
+        <p id="healthText">Checking service...</p>
+      </div>
+      <button id="refreshButton" type="button">Refresh</button>
+    </header>
+
+    <form id="workflowForm" class="workflow-form">
+      <label class="field field-full">
+        <span>Prompt</span>
+        <textarea id="promptInput" rows="6" placeholder="A cinematic neon garden waking up frame by frame"></textarea>
+      </label>
+
+      <label class="field">
+        <span>Mode</span>
+        <select id="modeInput">
+          <option value="images">Images</option>
+          <option value="video">Sora video</option>
+          <option value="both">Images + video</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Images</span>
+        <input id="imageCountInput" type="number" min="1" max="96" value="6">
+      </label>
+
+      <label class="field">
+        <span>Size</span>
+        <select id="sizeInput">
+          <option value="1024x1024">1024x1024</option>
+          <option value="1024x1536">1024x1536</option>
+          <option value="1536x1024">1536x1024</option>
+          <option value="720x1280">720x1280</option>
+          <option value="1280x720">1280x720</option>
+          <option value="1024x1792">1024x1792</option>
+          <option value="1792x1024">1792x1024</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Quality</span>
+        <select id="qualityInput">
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+          <option value="high">High</option>
+          <option value="auto">Auto</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Seconds</span>
+        <select id="secondsInput">
+          <option value="4">4</option>
+          <option value="8">8</option>
+          <option value="12">12</option>
+        </select>
+      </label>
+
+      <label class="check-field">
+        <input id="continuousInput" type="checkbox">
+        <span>Continuous</span>
+      </label>
+
+      <label class="check-field">
+        <input id="stitchVideoInput" type="checkbox">
+        <span>Stitch MP4</span>
+      </label>
+
+      <div class="actions">
+        <button class="primary-button" type="submit">Start</button>
+        <button id="extendButton" type="button" disabled>Extend</button>
+        <button id="stopButton" type="button" disabled>Stop</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="preview-panel">
+    <div class="section-head">
+      <h2>Outputs</h2>
+      <select id="jobSelect" aria-label="Jobs"></select>
+    </div>
+    <div class="status-line" id="jobStatus">No workflow selected.</div>
+    <div class="media-grid" id="mediaGrid"></div>
+    <div class="logs" id="logs"></div>
+  </section>
+</main>
+<script src="/app.js" type="module"></script>
+</body>
+</html>

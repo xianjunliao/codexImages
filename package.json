@@ -1,0 +1,17 @@
+{
+  "name": "codex-media-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "worker": "node scripts/codex-media-worker.js",
+    "worker:once": "node scripts/codex-media-worker.js --once",
+    "startup:install": "powershell -ExecutionPolicy Bypass -File scripts/install-startup-task.ps1",
+    "startup:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-startup-task.ps1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

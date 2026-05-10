@@ -1,0 +1,46 @@
+param(
+    [string]$LifeBaseUrl = "http://127.0.0.1:8080",
+    [string]$ProjectRoot = "e:\works\project\codexImages"
+)
+
+$ErrorActionPreference = "Continue"
+$logDir = Join-Path $ProjectRoot "logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$logFile = Join-Path $logDir "codex-media-worker.log"
+
+function Write-WorkerLog {
+    param([string]$Message)
+    $line = "[{0}] {1}" -f (Get-Date).ToString("s"), $Message
+    Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
+}
+
+Write-WorkerLog "Starting Codex Media worker loop. LifeBaseUrl=$LifeBaseUrl ProjectRoot=$ProjectRoot"
+
+while ($true) {
+    try {
+        Set-Location -LiteralPath $ProjectRoot
+        $env:LIFE_BASE_URL = $LifeBaseUrl
+        $env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL = if ($env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL) { $env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL } else { $LifeBaseUrl }
+        $env:CODEX_MEDIA_POLL_MS = if ($env:CODEX_MEDIA_POLL_MS) { $env:CODEX_MEDIA_POLL_MS } else { "10000" }
+        $env:CODEX_MEDIA_UPLOAD_TO_LIFE = if ($env:CODEX_MEDIA_UPLOAD_TO_LIFE) { $env:CODEX_MEDIA_UPLOAD_TO_LIFE } else { "true" }
+        $env:CODEX_MEDIA_OUTPUT_DIR = if ($env:CODEX_MEDIA_OUTPUT_DIR) { $env:CODEX_MEDIA_OUTPUT_DIR } else { Join-Path $ProjectRoot "generated\codex-media" }
+        if (-not $env:CODEX_COMMAND) {
+            $codexCommand = Get-Command codex.cmd -ErrorAction SilentlyContinue
+            if ($codexCommand) {
+                $env:CODEX_COMMAND = $codexCommand.Source
+            } elseif (Test-Path "E:\nvm4w\nodejs\codex.cmd") {
+                $env:CODEX_COMMAND = "E:\nvm4w\nodejs\codex.cmd"
+            }
+        }
+        $node = Get-Command node.exe -ErrorAction SilentlyContinue
+        if (-not $node) {
+            $node = Get-Command node -ErrorAction Stop
+        }
+        Write-WorkerLog "Launching node scripts/codex-media-worker.js"
+        & $node.Source (Join-Path $ProjectRoot "scripts\codex-media-worker.js") *>> $logFile
+        Write-WorkerLog "worker exited with code $LASTEXITCODE; restarting in 10 seconds"
+    } catch {
+        Write-WorkerLog ("worker launch failed: " + $_.Exception.Message)
+    }
+    Start-Sleep -Seconds 10
+}
