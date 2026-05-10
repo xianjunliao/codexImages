@@ -29,10 +29,12 @@ GET /api/codex-media/jobs?status=pending&limit=1
 5. The worker opens `codex exec`, passes the prompt, asks Codex to save generated assets under:
 
 ```text
-life/src/main/resources/static/lxj/generated/codex-media/<requestId>/
+codexImages/generated/codex-media/<requestId>/
 ```
 
-6. If assets were written, the worker marks the job:
+6. For `video` and `both` jobs, the worker can compose generated frames into `clip-0001.mp4` with FFmpeg.
+
+7. If assets were written, the worker uploads them to `life` and marks the job:
 
 ```text
 POST /api/codex-media/jobs/{requestId}/complete
@@ -48,6 +50,19 @@ Payload:
 }
 ```
 
+8. Done/error jobs can be deleted from `life`. The server changes the row to `delete_requested`; the local worker deletes the matching local output folder and calls:
+
+```text
+POST /api/codex-media/jobs/{requestId}/deleted
+```
+
 ## Why this is a relay
 
 Codex subscriptions do not expose a local HTTP API that `life` can call directly. The database queue gives the browser and a local Codex CLI worker a shared task mailbox. Whether final bitmap files can be produced depends on the `codex exec` session having access to an image generation tool that can write files to disk.
+
+## Current UX notes
+
+- The `life` AI chat detects likely image/video prompts and creates Codex Media jobs.
+- Ambiguous long visual prompts ask for confirmation before creating a job.
+- The chat task dock shows the current running media task and the next pending media task.
+- The media queue page is mobile-friendly, hides completed progress bars, and previews files only after the user clicks.
