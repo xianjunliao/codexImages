@@ -425,10 +425,10 @@ function contentType(filePath) {
 }
 
 function normalizeSize(value) {
-  const text = String(value || "1024x1024");
+  const text = String(value || "720x1280");
   return ["1024x1024", "1024x1536", "1536x1024", "720x1280", "1280x720", "1024x1792", "1792x1024"].includes(text)
     ? text
-    : "1024x1024";
+    : "720x1280";
 }
 
 function soraSize(size) {

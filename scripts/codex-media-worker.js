@@ -21,6 +21,7 @@ const outputRoot = process.env.CODEX_MEDIA_OUTPUT_DIR ||
 const publicOutputPrefix = process.env.CODEX_MEDIA_PUBLIC_PREFIX || "";
 const uploadToLife = String(process.env.CODEX_MEDIA_UPLOAD_TO_LIFE || "true").toLowerCase() !== "false";
 const uploadThemeName = process.env.CODEX_MEDIA_UPLOAD_THEME || "CodexMedia";
+const defaultAspectRatio = "9:16";
 
 await fs.mkdir(outputRoot, { recursive: true });
 
@@ -106,6 +107,9 @@ async function processJob(job) {
 
 async function processJobInner(job) {
   const requestId = job.request_id;
+  if (looksLikeMojibake(job.prompt)) {
+    throw new Error("任务提示词疑似编码损坏，已拒绝生成。请修复 life 请求/数据库编码后重新提交原始中文提示词。");
+  }
   const jobOutputDir = path.join(outputRoot, safeSegment(requestId));
   await fs.mkdir(jobOutputDir, { recursive: true });
   log(`Processing ${requestId}`);
@@ -114,7 +118,21 @@ async function processJobInner(job) {
   const lastMessageFile = path.join(jobOutputDir, "codex-last-message.txt");
   await fs.writeFile(promptFile, buildCodexPrompt(job, jobOutputDir), "utf8");
 
-  const result = await runCodex(promptFile, lastMessageFile);
+  const result = await runCodex(promptFile, lastMessageFile, job);
+  if (result.controlStatus === "paused") {
+    await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(requestId)}/paused`, {
+      reason: "Paused by user"
+    }).catch(() => {});
+    log(`Paused ${requestId}`);
+    return;
+  }
+  if (result.controlStatus === "canceled") {
+    await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(requestId)}/canceled`, {
+      reason: "Canceled by user"
+    }).catch(() => {});
+    log(`Canceled ${requestId}`);
+    return;
+  }
   let assets = await collectAssets(jobOutputDir);
   const lastMessage = existsSync(lastMessageFile)
     ? await fs.readFile(lastMessageFile, "utf8")
@@ -150,6 +168,7 @@ async function processJobInner(job) {
 
 function buildCodexPrompt(job, outputDir) {
   const options = parseJson(job.options_json);
+  const aspectRatio = String(options.aspect || "").trim() || defaultAspectRatio;
   const wantsVideo = isVideoMode(job.mode);
   const videoSeconds = parseVideoSeconds(job, options);
   const videoFrameCount = wantsVideo
@@ -180,7 +199,7 @@ function buildCodexPrompt(job, outputDir) {
     `Image count: ${videoFrameCount}`,
     wantsVideo ? `Target video duration: ${videoSeconds} seconds` : "",
     wantsVideo ? "Frame sequence guidance: create small, gradual motion changes between neighboring frames; avoid sudden changes in identity, pose, clothing, background, or lighting." : "",
-    `Aspect ratio: ${options.aspect || ""}`,
+    `Aspect ratio: ${aspectRatio}`,
     `Style: ${options.style || ""}`,
     `Continuity requirements: ${options.continuity || ""}`,
     "",
@@ -244,7 +263,7 @@ async function maybeComposeVideo(job, jobOutputDir, assets) {
   return [...assets, clipAsset];
 }
 
-async function runCodex(promptFile, lastMessageFile) {
+async function runCodex(promptFile, lastMessageFile, job) {
   return new Promise((resolve) => {
     const args = [
       "exec",
@@ -271,19 +290,32 @@ async function runCodex(promptFile, lastMessageFile) {
       return;
     }
 
-    const finish = (code, extraStderr = "") => {
+    const finish = (code, extraStderr = "", controlStatus = "") => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      resolve({ code, stdout, stderr: stderr + extraStderr });
+      clearInterval(controlPoll);
+      resolve({ code, stdout, stderr: stderr + extraStderr, controlStatus });
     };
     const timeout = setTimeout(() => {
       const message = `codex exec timed out after ${Math.round(codexTimeoutMs / 1000)} seconds`;
-      try {
-        child.kill();
-      } catch {}
+      terminateProcessTree(child);
       finish(1, message);
     }, codexTimeoutMs);
+    const controlPoll = setInterval(async () => {
+      if (!job?.request_id || settled) return;
+      try {
+        const data = await getJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(job.request_id)}`);
+        const status = String(data.job?.status || "").toLowerCase();
+        if (status === "pause_requested") {
+          terminateProcessTree(child);
+          finish(130, "codex exec paused by user", "paused");
+        } else if (status === "cancel_requested") {
+          terminateProcessTree(child);
+          finish(130, "codex exec canceled by user", "canceled");
+        }
+      } catch {}
+    }, 5000);
 
     child.stdout.on("data", chunk => { stdout += chunk.toString(); });
     child.stderr.on("data", chunk => { stderr += chunk.toString(); });
@@ -456,6 +488,13 @@ function parseJson(raw) {
   }
 }
 
+function looksLikeMojibake(text) {
+  const value = String(text || "");
+  if (value.length < 12) return false;
+  const suspicious = value.match(/[�]|涓|鎴|鐨|绋|濂|锛|銆|€|鏃|闀|鍦|浣|姘|璧|犱|勭|熸|彉|皑/g) || [];
+  return suspicious.length >= 4 || suspicious.length / Math.max(1, value.length) > 0.06;
+}
+
 function safeSegment(value) {
   return String(value || "job").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
 }
@@ -473,6 +512,21 @@ function contentType(fileName) {
   if (lower.endsWith(".gif")) return "image/gif";
   if (lower.endsWith(".mp4")) return "video/mp4";
   return "application/octet-stream";
+}
+
+function terminateProcessTree(child) {
+  if (!child?.pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+    } else {
+      child.kill("SIGTERM");
+    }
+  } catch {
+    try {
+      child.kill();
+    } catch {}
+  }
 }
 
 function isVideoMode(mode) {

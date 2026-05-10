@@ -5,13 +5,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$scriptPath = Join-Path $ProjectRoot "scripts\start-codex-media-worker.ps1"
-if (-not (Test-Path -LiteralPath $scriptPath)) {
-    throw "Worker startup script not found: $scriptPath"
+$launcherPath = Join-Path $ProjectRoot "scripts\start-codex-media-worker-hidden.vbs"
+if (-not (Test-Path -LiteralPath $launcherPath)) {
+    throw "Hidden worker launcher not found: $launcherPath"
 }
 
-$argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -LifeBaseUrl `"$LifeBaseUrl`" -ProjectRoot `"$ProjectRoot`""
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument -WorkingDirectory $ProjectRoot
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+
+$argument = "`"$launcherPath`" `"$LifeBaseUrl`""
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument $argument -WorkingDirectory $ProjectRoot
 $triggers = @(
     (New-ScheduledTaskTrigger -AtStartup),
     (New-ScheduledTaskTrigger -AtLogOn)
