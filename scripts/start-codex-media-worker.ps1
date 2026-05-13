@@ -23,7 +23,8 @@ if (Test-Path -LiteralPath $envFile) {
         if ($line -and -not $line.StartsWith("#") -and $line.Contains("=")) {
             $name, $value = $line.Split("=", 2)
             if ($name) {
-                [Environment]::SetEnvironmentVariable($name.Trim(), $value.Trim(), "Process")
+                $cleanName = $name.Trim().TrimStart([char]0xFEFF)
+                [Environment]::SetEnvironmentVariable($cleanName, $value.Trim(), "Process")
             }
         }
     }

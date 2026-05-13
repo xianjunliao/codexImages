@@ -23,8 +23,8 @@ CODEX_MEDIA_ACCESS_KEY=life-your-access-key
 The worker verifies this key with `POST /api/access/verify`, receives a session
 token, and then sends that token as `X-Life-Access-Token` on queue, control, and
 upload requests. If you already have a valid session token, you can set
-`CODEX_MEDIA_SESSION_TOKEN` instead. `CODEX_MEDIA_WORKER_TOKEN` is also sent as
-`X-Codex-Chat-Token` for deployments that use a dedicated worker token.
+`CODEX_MEDIA_SESSION_TOKEN` instead. `CODEX_MEDIA_WORKER_TOKEN` is sent as
+`X-Codex-Chat-Token` only when a deployment uses a dedicated media worker token.
 
 Or run one job:
 
@@ -46,6 +46,24 @@ codexImages/generated/codex-media/<requestId>/
 ```
 
 6. For `video` and `both` jobs, the worker can compose generated frames into `clip-0001.mp4` with FFmpeg.
+
+Video frame controls can be tuned from the worker environment:
+
+```dotenv
+CODEX_MEDIA_VIDEO_SOURCE_FPS=24
+CODEX_MEDIA_VIDEO_OUTPUT_FPS=24
+CODEX_MEDIA_VIDEO_SEGMENT_FRAMES=12
+CODEX_MEDIA_VIDEO_CONCURRENCY=1
+CODEX_MEDIA_VIDEO_INTERPOLATE=true
+```
+
+- `SOURCE_FPS` controls how many real image frames Codex is asked to generate per second.
+- `OUTPUT_FPS` controls the MP4 frame rate. Keep this at `24` for normal video playback.
+- `SEGMENT_FRAMES` splits large frame requests into smaller Codex runs.
+- `CONCURRENCY` is kept at `1` for video continuity. Frame segments run sequentially so each segment can continue from the previous frames.
+- `INTERPOLATE=true` uses FFmpeg motion interpolation when the output FPS is higher than the source FPS.
+
+The worker also understands prompt text like `24帧/秒` or `0.3秒8张图` and converts that into a source frame density. Source frame requests are capped at 240 frames per job to avoid runaway local runs.
 
 7. If assets were written, the worker uploads them to `life` and marks the job:
 

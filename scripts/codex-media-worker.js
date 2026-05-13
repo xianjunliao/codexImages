@@ -25,6 +25,11 @@ const lifeAccessKey = (process.env.CODEX_MEDIA_ACCESS_KEY || "").trim();
 let lifeAccessToken = (process.env.CODEX_MEDIA_SESSION_TOKEN || process.env.LIFE_ACCESS_TOKEN || "").trim();
 const workerToken = (process.env.CODEX_MEDIA_WORKER_TOKEN || process.env.CODEX_CHAT_WORKER_TOKEN || "").trim();
 const defaultAspectRatio = "9:16";
+const defaultVideoSourceFps = numberEnv("CODEX_MEDIA_VIDEO_SOURCE_FPS", 24);
+const defaultVideoOutputFps = numberEnv("CODEX_MEDIA_VIDEO_OUTPUT_FPS", 24);
+const defaultVideoSegmentFrames = numberEnv("CODEX_MEDIA_VIDEO_SEGMENT_FRAMES", 12);
+const defaultVideoConcurrency = numberEnv("CODEX_MEDIA_VIDEO_CONCURRENCY", 1);
+const enableVideoInterpolation = String(process.env.CODEX_MEDIA_VIDEO_INTERPOLATE || "true").toLowerCase() !== "false";
 
 await fs.mkdir(outputRoot, { recursive: true });
 await ensureLifeAuth();
@@ -63,7 +68,10 @@ async function takePendingJob() {
   const data = await getJson(`${lifeBaseUrl}/api/codex-media/jobs?status=pending&limit=1`);
   const job = data.jobs?.[0];
   if (!job) return null;
-  await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(job.request_id)}/running`, {});
+  await postJobProgress(job.request_id, {
+    phase: "queued",
+    progressText: "任务已领取，准备生成媒体。"
+  });
   return job;
 }
 
@@ -121,8 +129,20 @@ async function processJobInner(job) {
   const promptFile = path.join(jobOutputDir, "codex-prompt.txt");
   const lastMessageFile = path.join(jobOutputDir, "codex-last-message.txt");
   await fs.writeFile(promptFile, buildCodexPrompt(job, jobOutputDir), "utf8");
+  const settings = parseVideoSettings(job, parseJson(job.options_json));
+  if (settings.wantsVideo) {
+    const segments = buildFrameSegments(settings.frameCount, settings.segmentFrames);
+    await postVideoProgress(job, settings, {
+      phase: "starting",
+      completedFrames: 0,
+      completedSegments: 0,
+      totalSegments: segments.length,
+      startedAt: Date.now(),
+      extraText: "准备生成连续帧。"
+    });
+  }
 
-  const result = await runCodex(promptFile, lastMessageFile, job);
+  const result = await runCodexForJob(job, jobOutputDir, promptFile, lastMessageFile);
   if (result.controlStatus === "paused") {
     await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(requestId)}/paused`, {
       reason: "Paused by user"
@@ -158,7 +178,18 @@ async function processJobInner(job) {
 
   assets = await maybeComposeVideo(job, jobOutputDir, assets);
 
+  assets = filterFinalAssetsForJob(job, assets);
+
   if (uploadToLife) {
+    if (settings.wantsVideo) {
+      await postVideoProgress(job, settings, {
+        phase: "uploading",
+        completedFrames: settings.frameCount,
+        completedSegments: buildFrameSegments(settings.frameCount, settings.segmentFrames).length,
+        totalSegments: buildFrameSegments(settings.frameCount, settings.segmentFrames).length,
+        extraText: "视频已合成，正在上传。"
+      });
+    }
     assets = await uploadAssetsToLife(assets);
   }
 
@@ -170,14 +201,91 @@ async function processJobInner(job) {
   log(`Completed ${requestId} with ${assets.length} asset(s).`);
 }
 
-function buildCodexPrompt(job, outputDir) {
+async function runCodexForJob(job, jobOutputDir, promptFile, lastMessageFile) {
+  const settings = parseVideoSettings(job, parseJson(job.options_json));
+  if (!settings.wantsVideo || settings.frameCount <= settings.segmentFrames) {
+    return runCodex(promptFile, lastMessageFile, job);
+  }
+
+  const segmentDir = path.join(jobOutputDir, "codex-segments");
+  await fs.mkdir(segmentDir, { recursive: true });
+  const segments = buildFrameSegments(settings.frameCount, settings.segmentFrames);
+  log(`Video ${job.request_id}: generating ${settings.frameCount} source frames in ${segments.length} sequential segment(s), concurrency=${settings.concurrency}.`);
+  const startedAt = Date.now();
+  let completedSegments = 0;
+  let completedFrames = 0;
+  await postVideoProgress(job, settings, {
+    phase: "generating_frames",
+    completedFrames,
+    completedSegments,
+    totalSegments: segments.length,
+    startedAt,
+    extraText: `开始分段生成：共 ${segments.length} 段，并发 ${settings.concurrency}。`
+  });
+
+  const results = await runLimited(segments, 1, async (segment, index) => {
+    const segmentPromptFile = path.join(segmentDir, `segment-${String(index + 1).padStart(3, "0")}-prompt.txt`);
+    const segmentMessageFile = path.join(segmentDir, `segment-${String(index + 1).padStart(3, "0")}-last-message.txt`);
+    await fs.writeFile(segmentPromptFile, buildCodexPrompt(job, jobOutputDir, segment, settings), "utf8");
+    await postVideoProgress(job, settings, {
+      phase: "generating_frames",
+      completedFrames,
+      completedSegments,
+      totalSegments: segments.length,
+      activeSegment: index + 1,
+      activeRange: `${segment.start}-${segment.end}`,
+      startedAt,
+      extraText: `正在生成第 ${index + 1} 段：帧 ${segment.start}-${segment.end}。`
+    });
+    const result = await runCodex(segmentPromptFile, segmentMessageFile, job);
+    if (result.code === 0 && !result.controlStatus) {
+      completedSegments += 1;
+      completedFrames += segment.end - segment.start + 1;
+      await postVideoProgress(job, settings, {
+        phase: "generating_frames",
+        completedFrames,
+        completedSegments,
+        totalSegments: segments.length,
+        startedAt,
+        extraText: `已完成第 ${index + 1} 段：帧 ${segment.start}-${segment.end}。`
+      });
+    }
+    return result;
+  });
+
+  const failed = results.find(result => result.code !== 0 || result.controlStatus);
+  const combinedStdout = results.map(result => result.stdout || "").filter(Boolean).join("\n");
+  const combinedStderr = results.map(result => result.stderr || "").filter(Boolean).join("\n");
+  if (failed) {
+    return {
+      code: failed.code,
+      stdout: combinedStdout,
+      stderr: combinedStderr || failed.stderr,
+      controlStatus: failed.controlStatus
+    };
+  }
+
+  const summary = {
+    assets: [],
+    notes: `Generated ${settings.frameCount} source frames in ${segments.length} sequential segment(s).`
+  };
+  await fs.writeFile(lastMessageFile, JSON.stringify(summary, null, 2), "utf8");
+  return { code: 0, stdout: combinedStdout, stderr: combinedStderr };
+}
+
+function buildCodexPrompt(job, outputDir, frameSegment = null, videoSettings = null) {
   const options = parseJson(job.options_json);
   const aspectRatio = String(options.aspect || "").trim() || defaultAspectRatio;
-  const wantsVideo = isVideoMode(job.mode);
-  const videoSeconds = parseVideoSeconds(job, options);
-  const videoFrameCount = wantsVideo
-    ? Math.max(Number(job.image_count || 1), Math.round(videoSeconds * 8))
-    : Number(job.image_count || 1);
+  const settings = videoSettings || parseVideoSettings(job, options);
+  const wantsVideo = settings.wantsVideo;
+  const videoSeconds = settings.seconds;
+  const videoFrameCount = wantsVideo ? settings.frameCount : Number(job.image_count || 1);
+  const frameRange = frameSegment
+    ? `Frames for this Codex run: ${frameSegment.start}-${frameSegment.end} of ${settings.frameCount}. Save only these frame numbers.`
+    : "";
+  const previousFrameGuidance = frameSegment && frameSegment.start > 1
+    ? `Before generating this segment, inspect the existing previous frames in the output directory, especially frame-${String(frameSegment.start - 1).padStart(4, "0")}.png, and continue the same shot from that exact visual state.`
+    : "";
   return [
     "You are a local automated media generation worker for the life project.",
     "Generate the requested image or video assets, then save the final files into the exact output directory below.",
@@ -189,6 +297,7 @@ function buildCodexPrompt(job, outputDir) {
     "4. For continuous images, keep subject identity, scene language, camera language, and color logic consistent while changing motion, light, or composition gradually.",
     "5. Your final message must be a short JSON summary with assets and notes.",
     wantsVideo ? "6. For video mode, generate an ordered image sequence suitable for a short motion clip. Save frames as frame-0001.png, frame-0002.png, and so on. The worker will compose the MP4 after you finish." : "",
+    wantsVideo ? "7. Every frame filename must match its global frame number exactly, even when this is a segmented run. Example: frame-0013.png for global frame 13." : "",
     "",
     "Prompt handling:",
     "1. Preserve the user's visual intent as faithfully as possible. Do not add new character traits, camera angles, clothing, props, or story elements unless required for safety or basic coherence.",
@@ -202,7 +311,12 @@ function buildCodexPrompt(job, outputDir) {
     `Mode: ${job.mode || "images"}`,
     `Image count: ${videoFrameCount}`,
     wantsVideo ? `Target video duration: ${videoSeconds} seconds` : "",
+    wantsVideo ? `Source frame rate: ${settings.sourceFps} fps` : "",
+    wantsVideo ? `Output video frame rate: ${settings.outputFps} fps` : "",
+    frameRange,
+    previousFrameGuidance,
     wantsVideo ? "Frame sequence guidance: create small, gradual motion changes between neighboring frames; avoid sudden changes in identity, pose, clothing, background, or lighting." : "",
+    wantsVideo ? "Motion planning: treat the whole clip as one continuous shot. Use each frame's global index to advance the action by a tiny amount; keep lens, subject identity, clothing, background layout, and lighting locked unless the user requested a change." : "",
     `Aspect ratio: ${aspectRatio}`,
     `Style: ${options.style || ""}`,
     `Continuity requirements: ${options.continuity || ""}`,
@@ -214,7 +328,7 @@ function buildCodexPrompt(job, outputDir) {
 
 async function maybeComposeVideo(job, jobOutputDir, assets) {
   if (!isVideoMode(job.mode)) return assets;
-  if (assets.some(asset => /\.mp4$/i.test(asset.fileName))) return assets;
+  if (assets.some(asset => /\.mp4$/i.test(asset.fileName))) return filterFinalAssetsForJob(job, assets);
   const imageAssets = assets.filter(asset => /\.(png|jpe?g|webp)$/i.test(asset.fileName));
   if (imageAssets.length < 2) {
     throw new Error("视频模式至少需要 2 张连续帧图片，但当前只生成了 " + imageAssets.length + " 张。");
@@ -224,22 +338,46 @@ async function maybeComposeVideo(job, jobOutputDir, assets) {
   }
 
   const options = parseJson(job.options_json);
-  const seconds = parseVideoSeconds(job, options);
-  const fps = Math.max(1, Math.min(24, Math.round(imageAssets.length / seconds)));
+  const settings = parseVideoSettings(job, options);
+  const seconds = settings.seconds;
+  const sourceFps = Math.max(1, Math.round(imageAssets.length / seconds));
+  const outputFps = settings.outputFps;
   const orderedFrames = imageAssets.slice().sort((a, b) => a.fileName.localeCompare(b.fileName));
   const frameListFile = path.join(jobOutputDir, "ffmpeg-frames.txt");
   const clipName = "clip-0001.mp4";
   const clipPath = path.join(jobOutputDir, clipName);
-  const frameList = orderedFrames.map(asset => `file '${asset.path.replace(/'/g, "'\\''")}'`).join("\n");
+  const frameDuration = 1 / sourceFps;
+  const frameList = orderedFrames.flatMap((asset, index) => {
+    const escapedPath = asset.path.replace(/'/g, "'\\''");
+    const lines = [`file '${escapedPath}'`];
+    if (index < orderedFrames.length - 1) {
+      lines.push(`duration ${frameDuration.toFixed(6)}`);
+    }
+    return lines;
+  }).join("\n");
   await fs.writeFile(frameListFile, frameList + "\n", "utf8");
+  await postVideoProgress(job, settings, {
+    phase: "composing",
+    completedFrames: orderedFrames.length,
+    completedSegments: buildFrameSegments(settings.frameCount, settings.segmentFrames).length,
+    totalSegments: buildFrameSegments(settings.frameCount, settings.segmentFrames).length,
+    extraText: `连续帧已生成：${orderedFrames.length} / ${settings.frameCount}，正在合成 MP4。`
+  });
+  const filters = [
+    enableVideoInterpolation && outputFps > sourceFps
+      ? `minterpolate=fps=${outputFps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1`
+      : `fps=${outputFps}`,
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    "format=yuv420p"
+  ];
 
   const result = await runProcess(ffmpegCommand, [
     "-y",
-    "-r", String(fps),
     "-f", "concat",
     "-safe", "0",
     "-i", frameListFile,
-    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+    "-vf", filters.join(","),
+    "-r", String(outputFps),
     "-movflags", "+faststart",
     "-t", String(seconds),
     clipPath
@@ -258,13 +396,20 @@ async function maybeComposeVideo(job, jobOutputDir, assets) {
     localUrl: buildLocalAssetUrl(jobOutputDir, clipName),
     generatedFromFrames: orderedFrames.length,
     durationSeconds: seconds,
-    fps
+    sourceFps,
+    fps: outputFps,
+    interpolated: enableVideoInterpolation && outputFps > sourceFps
   };
 
-  if (String(job.mode || "").toLowerCase() === "video") {
-    return [clipAsset];
+  return filterFinalAssetsForJob(job, [...assets, clipAsset]);
+}
+
+function filterFinalAssetsForJob(job, assets) {
+  if (isVideoMode(job.mode)) {
+    const videos = assets.filter(asset => /\.mp4$/i.test(asset.fileName || ""));
+    return videos.length > 0 ? videos : assets;
   }
-  return [...assets, clipAsset];
+  return assets;
 }
 
 async function runCodex(promptFile, lastMessageFile, job) {
@@ -495,6 +640,68 @@ function authHeaders(extra = {}) {
   return headers;
 }
 
+async function postJobProgress(requestId, progress) {
+  if (!requestId) return;
+  const payload = {
+    ...progress,
+    resultText: progress.progressText || progress.resultText || ""
+  };
+  await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(requestId)}/running`, payload).catch((error) => {
+    log(`Progress update failed for ${requestId}: ${errorMessage(error)}`);
+  });
+}
+
+async function postVideoProgress(job, settings, progress) {
+  const completedFrames = Math.max(0, Math.min(settings.frameCount, Number(progress.completedFrames || 0)));
+  const totalFrames = settings.frameCount;
+  const completedSegments = Math.max(0, Number(progress.completedSegments || 0));
+  const totalSegments = Math.max(1, Number(progress.totalSegments || buildFrameSegments(totalFrames, settings.segmentFrames).length));
+  const percent = totalFrames > 0 ? Math.round((completedFrames / totalFrames) * 100) : 0;
+  const etaSeconds = estimateRemainingSeconds(progress.startedAt, completedFrames, totalFrames);
+  const etaText = formatEta(etaSeconds);
+  const segmentText = progress.activeSegment
+    ? `当前分段：第 ${progress.activeSegment} 段，共 ${totalSegments} 段${progress.activeRange ? `（帧 ${progress.activeRange}）` : ""}`
+    : `当前分段：已完成 ${completedSegments} 段，共 ${totalSegments} 段`;
+  const etaLine = etaText ? `预计剩余：${etaText}` : "预计剩余：计算中";
+  const progressText = [
+    `视频帧生成中：${completedFrames} / ${totalFrames}`,
+    segmentText,
+    etaLine,
+    progress.extraText || ""
+  ].filter(Boolean).join("\n");
+
+  await postJobProgress(job.request_id, {
+    phase: progress.phase || "generating_frames",
+    progress,
+    progressPercent: percent,
+    progressText,
+    completedFrames,
+    totalFrames,
+    completedSegments,
+    totalSegments,
+    etaSeconds,
+    sourceFps: settings.sourceFps,
+    outputFps: settings.outputFps,
+    durationSeconds: settings.seconds
+  });
+}
+
+function estimateRemainingSeconds(startedAt, completed, total) {
+  if (!startedAt || completed <= 0 || total <= completed) return null;
+  const elapsedSeconds = Math.max(1, (Date.now() - startedAt) / 1000);
+  return Math.max(0, Math.round((elapsedSeconds / completed) * (total - completed)));
+}
+
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds)) return "";
+  if (seconds < 60) return `约 ${Math.max(1, Math.round(seconds))} 秒`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `约 ${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return `约 ${hours} 小时${restMinutes ? ` ${restMinutes} 分钟` : ""}`;
+}
+
 async function ensureLifeAuth() {
   if (lifeAccessToken || !lifeAccessKey) return;
   const response = await fetch(`${lifeBaseUrl}/api/access/verify`, {
@@ -523,7 +730,7 @@ function parseJson(raw) {
 function looksLikeMojibake(text) {
   const value = String(text || "");
   if (value.length < 12) return false;
-  const suspicious = value.match(/[�]|涓|鎴|鐨|绋|濂|锛|銆|€|鏃|闀|鍦|浣|姘|璧|犱|勭|熸|彉|皑/g) || [];
+  const suspicious = value.match(/[�]|涓|鎴|鐨|绋|濂|锛|銆|€|鏃|闀|鍦|浣|姘|璧|犳|勭|熸|彉|皑/g) || [];
   return suspicious.length >= 4 || suspicious.length / Math.max(1, value.length) > 0.06;
 }
 
@@ -566,6 +773,78 @@ function isVideoMode(mode) {
   return value === "video" || value === "both";
 }
 
+function parseVideoSettings(job, options = {}) {
+  const wantsVideo = isVideoMode(job.mode);
+  const seconds = parseVideoSeconds(job, options);
+  const promptFrameDensity = parsePromptFrameDensityZh(job.prompt);
+  const sourceFps = clampInteger(firstFiniteNumber([
+    options.sourceFps,
+    options.videoSourceFps,
+    options.frameFps,
+    promptFrameDensity,
+    options.fps,
+    parsePromptNumber(job.prompt, /(?:source\s*)?fps\s*[:=]?\s*(\d+(?:\.\d+)?)/i),
+    parsePromptNumber(job.prompt, /(\d+(?:\.\d+)?)\s*(?:帧|張|张)\s*(?:\/|每)?\s*(?:秒|s|sec|second)/i),
+    parsePromptFrameDensity(job.prompt),
+    defaultVideoSourceFps
+  ]), 1, 30, 8);
+  const outputFps = clampInteger(firstFiniteNumber([
+    options.outputFps,
+    options.videoOutputFps,
+    options.renderFps,
+    parsePromptOutputFps(job.prompt),
+    parsePromptNumber(job.prompt, /(?:output|render)\s*fps\s*[:=]?\s*(\d+(?:\.\d+)?)/i),
+    defaultVideoOutputFps
+  ]), 1, 60, 24);
+  const requestedFrames = Number(job.image_count || 0);
+  const frameCount = wantsVideo
+    ? clampInteger(Math.max(requestedFrames || 0, Math.ceil(seconds * sourceFps)), 2, 240, Math.ceil(seconds * sourceFps))
+    : Math.max(1, requestedFrames || 1);
+  const segmentFrames = clampInteger(firstFiniteNumber([
+    options.segmentFrames,
+    options.videoSegmentFrames,
+    defaultVideoSegmentFrames
+  ]), 1, 60, 12);
+  const concurrency = clampInteger(firstFiniteNumber([
+    options.concurrency,
+    options.videoConcurrency,
+    defaultVideoConcurrency
+  ]), 1, 1, 1);
+  return {
+    wantsVideo,
+    seconds,
+    sourceFps,
+    outputFps,
+    frameCount,
+    segmentFrames,
+    concurrency
+  };
+}
+
+function buildFrameSegments(frameCount, segmentFrames) {
+  const segments = [];
+  for (let start = 1; start <= frameCount; start += segmentFrames) {
+    segments.push({
+      start,
+      end: Math.min(frameCount, start + segmentFrames - 1)
+    });
+  }
+  return segments;
+}
+
+async function runLimited(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 function parseVideoSeconds(job, options = {}) {
   const candidates = [
     options.duration,
@@ -574,6 +853,14 @@ function parseVideoSeconds(job, options = {}) {
     job.prompt
   ].map(value => String(value || ""));
   for (const value of candidates) {
+    const zhRangeMatch = value.match(/(\d+(?:\.\d+)?)\s*(?:~|-|到|至)\s*(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)?/i);
+    if (zhRangeMatch) {
+      return clampSeconds(Number(zhRangeMatch[2]));
+    }
+    const zhMatch = value.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)/i);
+    if (zhMatch) {
+      return clampSeconds(Number(zhMatch[1]));
+    }
     const rangeMatch = value.match(/(\d+(?:\.\d+)?)\s*(?:~|-|到|至)\s*(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)?/i);
     if (rangeMatch) {
       return clampSeconds(Number(rangeMatch[2]));
@@ -589,6 +876,64 @@ function parseVideoSeconds(job, options = {}) {
 function clampSeconds(value) {
   if (!Number.isFinite(value) || value <= 0) return 3;
   return Math.max(1, Math.min(6, value));
+}
+
+function numberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function firstFiniteNumber(values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return NaN;
+}
+
+function clampInteger(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function parsePromptNumber(prompt, pattern) {
+  const match = String(prompt || "").match(pattern);
+  return match ? Number(match[1]) : NaN;
+}
+
+function parsePromptFrameDensityZh(prompt) {
+  const value = String(prompt || "");
+  const match = value.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)\s*(?:内|里|中)?\s*(\d+(?:\.\d+)?)\s*(?:帧|幀|张|張|图|圖|images?|frames?)/i);
+  if (!match) return NaN;
+  const seconds = Number(match[1]);
+  const frames = Number(match[2]);
+  if (!Number.isFinite(seconds) || !Number.isFinite(frames) || seconds <= 0) return NaN;
+  return frames / seconds;
+}
+
+function parsePromptOutputFps(prompt) {
+  const value = String(prompt || "");
+  const patterns = [
+    /(?:output|render)\s*fps\s*[:=]\s*(\d+(?:\.\d+)?)/i,
+    /输出\s*(?:帧率)?\s*[:=：]?\s*(\d+(?:\.\d+)?)\s*(?:帧|幀|fps)?/i,
+    /最终\s*(?:帧率)?\s*[:=：]?\s*(\d+(?:\.\d+)?)\s*(?:帧|幀|fps)?/i
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) return Number(match[1]);
+  }
+  return NaN;
+}
+
+function parsePromptFrameDensity(prompt) {
+  const value = String(prompt || "");
+  const match = value.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|sec|second)\s*(\d+(?:\.\d+)?)\s*(?:帧|張|张|images?|frames?)/i);
+  if (!match) return NaN;
+  const seconds = Number(match[1]);
+  const frames = Number(match[2]);
+  if (!Number.isFinite(seconds) || !Number.isFinite(frames) || seconds <= 0) return NaN;
+  return frames / seconds;
 }
 
 function buildLocalAssetUrl(dir, fileName) {
