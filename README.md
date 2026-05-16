@@ -139,6 +139,19 @@ npm run worker
 npm run worker:once
 ```
 
+## life -> ComfyUI workflow parameters
+
+When a `life` media job uses `mediaProvider: comfyui`, the worker keeps the
+loaded ComfyUI workflow settings authoritative. Request metadata such as
+`aspect`, `durationSeconds`, `fps`, `frames`, `steps`, `size`, and
+`negativePrompt` may still appear in the `life` job details, but those values are
+not used to overwrite ComfyUI graph parameters.
+
+The worker only injects the runtime fields needed to execute the job: the
+positive prompt, output filename prefix, and the uploaded input image for
+image-to-video workflows. The final payload sent to ComfyUI is saved beside the
+job output as `comfyui-prompt.json` for verification.
+
 ## Windows 开机自启
 
 安装计划任务：

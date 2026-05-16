@@ -91,6 +91,21 @@ POST /api/codex-media/jobs/{requestId}/deleted
 
 Codex subscriptions do not expose a local HTTP API that `life` can call directly. The database queue gives the browser and a local Codex CLI worker a shared task mailbox. Whether final bitmap files can be produced depends on the `codex exec` session having access to an image generation tool that can write files to disk.
 
+## ComfyUI workflow parameter isolation
+
+For `life` jobs with `mediaProvider: comfyui`, the local worker treats the
+selected ComfyUI workflow file as the source of truth for generation settings.
+Job metadata such as `aspect`, `durationSeconds`, `fps`, `frames`, `steps`,
+`size`, and `negativePrompt` is left visible in `life` for audit/debugging, but
+is not used to overwrite graph values before submitting to ComfyUI.
+
+The worker only injects runtime values required to connect the job to the
+workflow: the positive prompt, output filename prefix, and an uploaded input
+image for image-to-video workflows. Each submitted ComfyUI prompt graph is saved
+as `comfyui-prompt.json` in the local job output directory so the exact payload
+can be inspected after a run. Restart `codex-media-worker` after code changes;
+already-running Node worker processes keep the old logic in memory.
+
 ## Authentication
 
 Browser authentication does not automatically apply to the local Node worker.
