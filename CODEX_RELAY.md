@@ -25,6 +25,10 @@ token, and then sends that token as `X-Life-Access-Token` on queue, control, and
 upload requests. If you already have a valid session token, you can set
 `CODEX_MEDIA_SESSION_TOKEN` instead. `CODEX_MEDIA_WORKER_TOKEN` is sent as
 `X-Codex-Chat-Token` only when a deployment uses a dedicated media worker token.
+Transient startup auth failures such as TLS resets are retried every
+`CODEX_MEDIA_AUTH_RETRY_MS` milliseconds, defaulting to 30000. Permanent
+configuration errors such as invalid access keys still fail fast so the local
+`.env` can be corrected.
 
 Or run one job:
 
@@ -124,6 +128,48 @@ one of these environment values:
 
 The local `.env` file is ignored by git and is loaded automatically by
 `scripts/start-codex-media-worker.ps1`.
+
+## Troubleshooting
+
+### Job stays queued with no visible error
+
+If the browser says the media task has been created and is waiting for the local
+worker, the cloud queue is reachable but no local worker has successfully claimed
+that job yet. Check, in order:
+
+1. `logs/worker.err.log` for startup/auth failures.
+2. `logs/worker.out.log` for `Codex media worker started`, `Processing <requestId>`, and `ComfyUI queued <promptId>`.
+3. `logs/local-services.log` for the resolved `LifeBaseUrl`.
+4. Local ComfyUI health at `http://127.0.0.1:8188`.
+
+Common causes are: the worker was not started, `LIFE_BASE_URL` points to the
+wrong environment, the access key/session token is invalid, or the worker was
+started before network/proxy connectivity was ready. Network/TLS startup errors
+are retried automatically; invalid credentials require fixing `.env` and
+restarting the worker.
+
+## Prompt guidance for image-to-video
+
+Image-to-video workflows are sensitive to face motion. Prompts that ask for
+head turns, looking down/up, smiling, or pushing into a facial close-up often
+force the model to redraw the face. For identity stability, keep the face locked
+and put visible motion into non-face elements:
+
+```text
+Use the uploaded image as the first frame. Keep the same person, face, hair,
+clothes, object, background, and composition. The face must stay stable: no head
+turn, no looking down/up, no mouth movement, no smile, and no facial close-up.
+
+Make the change visible outside the face: stronger wind moves hair tips and coat
+edges, steam rises from the cup, distant city lights turn on, and the sunset
+darkens from warm orange to blue-purple. Use only a very slight stable camera
+push. No scene cut, no new person, no clothing color change, no text, no
+watermark.
+
+Negative: face morphing, identity change, distorted face, warped eyes, changing
+mouth, extra teeth, bad anatomy, flicker, jitter, duplicate face, melted face,
+blurry face.
+```
 
 ## Current UX notes
 

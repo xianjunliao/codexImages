@@ -74,6 +74,7 @@ CODEX_MEDIA_PUBLIC_LIFE_BASE_URL=http://127.0.0.1:8080
 CODEX_MEDIA_ACCESS_KEY=life-your-access-key
 CODEX_MEDIA_SESSION_TOKEN=
 CODEX_MEDIA_WORKER_TOKEN=
+CODEX_MEDIA_AUTH_RETRY_MS=30000
 CODEX_MEDIA_UPLOAD_TO_LIFE=true
 CODEX_MEDIA_VIDEO_SOURCE_FPS=24
 CODEX_MEDIA_VIDEO_OUTPUT_FPS=24
@@ -91,6 +92,7 @@ CODEX_MEDIA_VIDEO_INTERPOLATE=true
 | `CODEX_MEDIA_ACCESS_KEY` | 空 | 站点访问密钥，worker 启动时会换取 session token |
 | `CODEX_MEDIA_SESSION_TOKEN` | 空 | 已有的 `life_access_token` |
 | `CODEX_MEDIA_WORKER_TOKEN` | 空 | 可选的专用 worker token |
+| `CODEX_MEDIA_AUTH_RETRY_MS` | `30000` | worker 启动鉴权遇到网络/TLS 临时错误时的重试间隔 |
 | `CODEX_MEDIA_POLL_MS` | `10000` | worker 拉取任务间隔 |
 | `CODEX_MEDIA_DELETE_POLL_MS` | `5000` | 删除请求巡检间隔 |
 | `CODEX_MEDIA_OUTPUT_DIR` | `generated/codex-media` | 本地生成输出目录 |
@@ -138,6 +140,20 @@ npm run worker
 ```powershell
 npm run worker:once
 ```
+
+## 常见问题
+
+### 页面一直显示“等待本地 worker”
+
+如果 `/lxj/pages/codex-media.html` 显示任务已创建，但长时间停在“等待本地 worker 生成”，通常说明云端队列已有任务，本机 worker 没有成功领取。优先检查：
+
+1. 本机服务是否已启动：`npm run services` 或 `powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1`。
+2. ComfyUI 是否可访问：`http://127.0.0.1:8188`。
+3. worker 日志：`logs/worker.err.log` 和 `logs/worker.out.log`。
+4. `.env` 中的 `LIFE_BASE_URL` 是否指向正确环境，例如云端为 `https://www.liaoxianjun.com`。
+5. `CODEX_MEDIA_ACCESS_KEY` 或 `CODEX_MEDIA_SESSION_TOKEN` 是否有效。
+
+如果日志里出现 `fetch failed`、`ECONNRESET`、TLS 连接断开等临时网络错误，worker 会按 `CODEX_MEDIA_AUTH_RETRY_MS` 自动重试，不需要重新创建任务。若是 access key 错误、接口返回 401/403，则需要修正 `.env` 后重启 worker。
 
 ## life -> ComfyUI workflow parameters
 
@@ -199,6 +215,24 @@ scripts\start-codex-media-worker.ps1
 
 ```text
 生成 0.3 秒 8 张图并合成视频，输出 24帧/秒。玻璃杯落到木桌上，水珠飞溅，微距镜头，动作连续。
+```
+
+### 图生视频提示词建议
+
+图生视频最容易在“转头、低头、抬眼、微笑、推近到面部特写”时出现脸部变形。想要明显变化时，优先把变化放在环境、风、衣物、道具和光线上，脸部保持稳定。
+
+推荐结构：
+
+```text
+生成 4 秒视频，9:16，真实摄影风格。以上传图片作为第一帧，严格保持同一个人物、同一张脸、同一五官比例、同一发型、同一服装、同一道具和同一场景。
+
+重要：人物脸部必须保持稳定，不改变长相，不改变表情，不转头，不低头，不抬眼，不张嘴，不微笑。脸部像照片一样保持清晰自然，只允许非常轻微的呼吸感。
+
+明显变化集中在脸以外：一阵晚风吹过，发丝末端和衣角明显飘动；道具上方的热气或烟雾持续升起并扩散；远处灯光逐渐从暗到亮点亮；环境光从暖色慢慢过渡到更深的蓝紫色。镜头保持基本固定，只做非常轻微的稳定推进，不进入面部特写。
+
+要求动作连续平滑，人物身份稳定，脸部不变形，眼睛不漂移，嘴巴不变形，手指不变形，道具不漂移，不新增人物，不切换场景，不改变服装颜色，不出现文字、水印、logo。
+
+负面约束：face morphing, identity change, distorted face, warped eyes, changing mouth, extra teeth, bad anatomy, flicker, jitter, duplicate face, melted face, blurry face.
 ```
 
 ## 与 `life` 的关系
