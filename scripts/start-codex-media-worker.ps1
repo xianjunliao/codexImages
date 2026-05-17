@@ -1,5 +1,5 @@
 param(
-    [string]$LifeBaseUrl = "http://127.0.0.1:8080",
+    [string]$LifeBaseUrl = "",
     [string]$ProjectRoot = "e:\works\project\codexImages"
 )
 
@@ -34,8 +34,15 @@ if (Test-Path -LiteralPath $envFile) {
 while ($true) {
     try {
         Set-Location -LiteralPath $ProjectRoot
-        $env:LIFE_BASE_URL = $LifeBaseUrl
-        $env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL = if ($env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL) { $env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL } else { $LifeBaseUrl }
+        $resolvedLifeBaseUrl = if (-not [string]::IsNullOrWhiteSpace($LifeBaseUrl)) {
+            $LifeBaseUrl
+        } elseif (-not [string]::IsNullOrWhiteSpace($env:LIFE_BASE_URL)) {
+            $env:LIFE_BASE_URL
+        } else {
+            "http://127.0.0.1:8080"
+        }
+        $env:LIFE_BASE_URL = $resolvedLifeBaseUrl
+        $env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL = if ($env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL) { $env:CODEX_MEDIA_PUBLIC_LIFE_BASE_URL } else { $resolvedLifeBaseUrl }
         $env:CODEX_MEDIA_POLL_MS = if ($env:CODEX_MEDIA_POLL_MS) { $env:CODEX_MEDIA_POLL_MS } else { "10000" }
         $env:CODEX_MEDIA_UPLOAD_TO_LIFE = if ($env:CODEX_MEDIA_UPLOAD_TO_LIFE) { $env:CODEX_MEDIA_UPLOAD_TO_LIFE } else { "true" }
         $env:CODEX_MEDIA_OUTPUT_DIR = if ($env:CODEX_MEDIA_OUTPUT_DIR) { $env:CODEX_MEDIA_OUTPUT_DIR } else { Join-Path $ProjectRoot "generated\codex-media" }

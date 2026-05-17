@@ -95,16 +95,20 @@ Codex subscriptions do not expose a local HTTP API that `life` can call directly
 
 For `life` jobs with `mediaProvider: comfyui`, the local worker treats the
 selected ComfyUI workflow file as the source of truth for generation settings.
-Job metadata such as `aspect`, `durationSeconds`, `fps`, `frames`, `steps`,
-`size`, and `negativePrompt` is left visible in `life` for audit/debugging, but
-is not used to overwrite graph values before submitting to ComfyUI.
+Job metadata such as `aspect`, `fps`, `frames`, `steps`, `size`, and
+`negativePrompt` is left visible in `life` for audit/debugging, but is not used
+to overwrite graph values before submitting to ComfyUI. An explicitly requested
+duration such as "6 seconds" or "6s" is the exception: the worker keeps the
+workflow's fps/frame-rate settings and only adjusts the workflow video latent
+frame count to `durationSeconds * workflowFps`.
 
 The worker only injects runtime values required to connect the job to the
-workflow: the positive prompt, output filename prefix, and an uploaded input
-image for image-to-video workflows. Each submitted ComfyUI prompt graph is saved
-as `comfyui-prompt.json` in the local job output directory so the exact payload
-can be inspected after a run. Restart `codex-media-worker` after code changes;
-already-running Node worker processes keep the old logic in memory.
+workflow: the positive prompt, optional explicit-duration frame count, output
+filename prefix, and an uploaded input image for image-to-video workflows. Each
+submitted ComfyUI prompt graph is saved as `comfyui-prompt.json` in the local
+job output directory so the exact payload can be inspected after a run. Restart
+`codex-media-worker` after code changes; already-running Node worker processes
+keep the old logic in memory.
 
 ## Authentication
 

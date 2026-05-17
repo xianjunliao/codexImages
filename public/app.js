@@ -1,15 +1,22 @@
 const form = document.querySelector("#workflowForm");
 const promptInput = document.querySelector("#promptInput");
+const providerInput = document.querySelector("#providerInput");
+const comfyWorkflowSelect = document.querySelector("#comfyWorkflowSelect");
 const modeInput = document.querySelector("#modeInput");
-const imageCountInput = document.querySelector("#imageCountInput");
 const sizeInput = document.querySelector("#sizeInput");
+const qualityField = document.querySelector("#qualityField");
 const qualityInput = document.querySelector("#qualityInput");
+const secondsField = document.querySelector("#secondsField");
 const secondsInput = document.querySelector("#secondsInput");
-const continuousInput = document.querySelector("#continuousInput");
-const stitchVideoInput = document.querySelector("#stitchVideoInput");
+const videoFpsInput = document.querySelector("#videoFpsInput");
+const videoFramesInput = document.querySelector("#videoFramesInput");
+const stepsInput = document.querySelector("#stepsInput");
+const fpsField = document.querySelector("#fpsField");
+const framesField = document.querySelector("#framesField");
+const initImageField = document.querySelector("#initImageField");
+const initImageInput = document.querySelector("#initImageInput");
 const healthText = document.querySelector("#healthText");
 const refreshButton = document.querySelector("#refreshButton");
-const extendButton = document.querySelector("#extendButton");
 const stopButton = document.querySelector("#stopButton");
 const jobSelect = document.querySelector("#jobSelect");
 const jobStatus = document.querySelector("#jobStatus");
@@ -18,8 +25,10 @@ const logs = document.querySelector("#logs");
 
 let activeJobId = "";
 let pollTimer = null;
+let comfyWorkflows = [];
 
 await refreshHealth();
+await loadComfyWorkflows();
 await loadJobs();
 startPolling();
 
@@ -30,15 +39,25 @@ form.addEventListener("submit", async event => {
     jobStatus.textContent = "Prompt is required.";
     return;
   }
+  const workflow = selectedWorkflow();
+  const workflowName = workflow?.name || comfyWorkflowSelect.value;
   const response = await postJson("/api/workflows", {
     prompt,
+    provider: providerInput.value,
+    comfyImageWorkflow: workflowName,
+    comfyVideoWorkflow: workflowName,
+    comfyImageToVideoWorkflow: workflowName,
     mode: modeInput.value,
-    imageCount: Number(imageCountInput.value),
+    imageCount: 1,
     size: sizeInput.value,
     quality: qualityInput.value,
     seconds: secondsInput.value,
-    continuous: continuousInput.checked,
-    stitchVideo: stitchVideoInput.checked
+    videoFps: Number(videoFpsInput.value),
+    videoFrames: Number(videoFramesInput.value),
+    steps: Number(stepsInput.value),
+    initImage: await readInitImage(),
+    continuous: false,
+    stitchVideo: false
   });
   activeJobId = response.job.id;
   await loadJobs();
@@ -46,16 +65,11 @@ form.addEventListener("submit", async event => {
 
 refreshButton.addEventListener("click", loadJobs);
 
+comfyWorkflowSelect.addEventListener("change", applySelectedWorkflow);
+providerInput.addEventListener("change", applySelectedWorkflow);
+
 jobSelect.addEventListener("change", async () => {
   activeJobId = jobSelect.value;
-  await renderActiveJob();
-});
-
-extendButton.addEventListener("click", async () => {
-  if (!activeJobId) return;
-  await postJson(`/api/workflows/${activeJobId}/extend`, {
-    imageCount: Number(imageCountInput.value) || 4
-  });
   await renderActiveJob();
 });
 
@@ -68,10 +82,71 @@ stopButton.addEventListener("click", async () => {
 async function refreshHealth() {
   try {
     const health = await getJson("/api/health");
-    healthText.textContent = health.hasOpenAIKey ? "Ready" : "OPENAI_API_KEY missing";
+    providerInput.value = health.mediaProvider || providerInput.value;
+    healthText.textContent = health.mediaProvider === "comfyui"
+      ? `ComfyUI ${health.comfyBaseUrl}`
+      : (health.hasOpenAIKey ? "Ready" : "OPENAI_API_KEY missing");
   } catch (error) {
     healthText.textContent = error.message;
   }
+}
+
+async function loadComfyWorkflows() {
+  const data = await getJson("/api/comfy/workflows");
+  comfyWorkflows = data.workflows || [];
+  comfyWorkflowSelect.innerHTML = "";
+  comfyWorkflows.forEach(workflow => {
+    const option = document.createElement("option");
+    option.value = workflow.name;
+    option.textContent = `${workflowLabel(workflow.kind)} · ${workflow.name}`;
+    comfyWorkflowSelect.append(option);
+  });
+  const preferred = comfyWorkflows.find(workflow => workflow.name === "unsloth_qwen_image_2512")
+    || comfyWorkflows.find(workflow => workflow.kind === "image")
+    || comfyWorkflows[0];
+  if (preferred) comfyWorkflowSelect.value = preferred.name;
+  applySelectedWorkflow();
+}
+
+function selectedWorkflow() {
+  return comfyWorkflows.find(workflow => workflow.name === comfyWorkflowSelect.value);
+}
+
+function applySelectedWorkflow() {
+  const workflow = selectedWorkflow();
+  if (!workflow) return;
+  modeInput.value = workflow.kind === "image-video" ? "image-video" : workflow.kind === "video" ? "video" : "images";
+  if (workflow.defaults?.size) sizeInput.value = workflow.defaults.size;
+  if (workflow.defaults?.fps) videoFpsInput.value = workflow.defaults.fps;
+  if (workflow.defaults?.frames) videoFramesInput.value = workflow.defaults.frames;
+  if (workflow.defaults?.steps) stepsInput.value = workflow.defaults.steps;
+  const isVideo = workflow.kind === "video" || workflow.kind === "image-video";
+  const isOpenAI = providerInput.value === "openai";
+  qualityField.hidden = !isOpenAI;
+  secondsField.hidden = !isOpenAI;
+  fpsField.hidden = !isVideo;
+  framesField.hidden = !isVideo;
+  initImageField.hidden = workflow.kind !== "image-video";
+}
+
+function workflowLabel(kind) {
+  return {
+    image: "文生图",
+    video: "文生视频",
+    "image-video": "图生视频",
+    unknown: "未知"
+  }[kind] || kind;
+}
+
+function readInitImage() {
+  const file = initImageInput.files?.[0];
+  if (!file) return null;
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: file.name, dataUrl: reader.result });
+    reader.onerror = () => reject(reader.error || new Error("Image read failed."));
+    reader.readAsDataURL(file);
+  });
 }
 
 async function loadJobs() {
@@ -93,16 +168,15 @@ async function renderActiveJob() {
     jobStatus.textContent = "No workflow selected.";
     mediaGrid.innerHTML = "";
     logs.innerHTML = "";
-    extendButton.disabled = true;
     stopButton.disabled = true;
     return;
   }
   const data = await getJson(`/api/workflows/${activeJobId}`);
   const job = data.job;
-  const imageCount = job.images?.length || 0;
+  const hasImage = (job.images?.length || 0) > 0;
   const videoState = job.video ? ` · video ${job.video.status}` : "";
-  jobStatus.textContent = `${job.status} · ${imageCount}/${job.targetImages} images${videoState}`;
-  extendButton.disabled = job.mode === "video";
+  const outputState = hasImage ? "image ready" : "waiting for output";
+  jobStatus.textContent = `${job.status} · ${job.provider || "openai"} · ${outputState}${videoState}`;
   stopButton.disabled = !["queued", "running"].includes(job.status);
   mediaGrid.innerHTML = "";
   (job.images || []).forEach(image => {

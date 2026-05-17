@@ -1,6 +1,6 @@
 param(
     [string]$TaskName = "CodexMediaWorker",
-    [string]$LifeBaseUrl = "http://127.0.0.1:8080",
+    [string]$LifeBaseUrl = "",
     [string]$ProjectRoot = "e:\works\project\codexImages"
 )
 
@@ -12,7 +12,10 @@ if (-not (Test-Path -LiteralPath $launcherPath)) {
 
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
-$argument = "`"$launcherPath`" `"$LifeBaseUrl`""
+$argument = "`"$launcherPath`""
+if (-not [string]::IsNullOrWhiteSpace($LifeBaseUrl)) {
+    $argument = "$argument `"$LifeBaseUrl`""
+}
 $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument $argument -WorkingDirectory $ProjectRoot
 $triggers = @(
     (New-ScheduledTaskTrigger -AtStartup),
@@ -33,4 +36,4 @@ Start-ScheduledTask -TaskName $TaskName
 
 Write-Host "Installed and started scheduled task: $TaskName"
 Write-Host "LifeBaseUrl: $LifeBaseUrl"
-Write-Host "Log file: $(Join-Path $ProjectRoot 'logs\codex-media-worker.log')"
+Write-Host "Services log file: $(Join-Path $ProjectRoot 'logs\local-services.log')"

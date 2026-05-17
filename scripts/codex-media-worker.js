@@ -14,6 +14,9 @@ const lifeBaseUrl = (process.env.LIFE_BASE_URL || "http://127.0.0.1:8080").repla
 const publicLifeBaseUrl = (process.env.CODEX_MEDIA_PUBLIC_LIFE_BASE_URL || lifeBaseUrl).replace(/\/$/, "");
 const pollMs = Number(process.env.CODEX_MEDIA_POLL_MS || 10000);
 const deletePollMs = Number(process.env.CODEX_MEDIA_DELETE_POLL_MS || 5000);
+const workflowSyncMs = Math.max(5000, Number(process.env.CODEX_MEDIA_WORKFLOW_SYNC_MS || 60000));
+const workflowSyncEnabled = String(process.env.CODEX_MEDIA_WORKFLOW_SYNC_ENABLED || "true").toLowerCase() !== "false";
+const codexImagesBaseUrl = (process.env.CODEX_IMAGES_BASE_URL || process.env.CODEX_MEDIA_LOCAL_BASE_URL || "http://127.0.0.1:3027").replace(/\/$/, "");
 const once = process.argv.includes("--once");
 const noDeleteSweeper = process.argv.includes("--no-delete-sweeper");
 const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
@@ -26,7 +29,9 @@ const uploadToLife = String(process.env.CODEX_MEDIA_UPLOAD_TO_LIFE || "true").to
 const uploadThemeName = process.env.CODEX_MEDIA_UPLOAD_THEME || "CodexMedia";
 const lifeAccessKey = (process.env.CODEX_MEDIA_ACCESS_KEY || "").trim();
 let lifeAccessToken = (process.env.CODEX_MEDIA_SESSION_TOKEN || process.env.LIFE_ACCESS_TOKEN || "").trim();
+const authRetryMs = Math.max(1000, numberEnv("CODEX_MEDIA_AUTH_RETRY_MS", 30000));
 const workerToken = (process.env.CODEX_MEDIA_WORKER_TOKEN || process.env.CODEX_CHAT_WORKER_TOKEN || "").trim();
+const workerId = (process.env.CODEX_MEDIA_WORKER_ID || process.env.COMPUTERNAME || process.env.HOSTNAME || "codexImages").trim();
 const defaultAspectRatio = "9:16";
 const defaultVideoSourceFps = numberEnv("CODEX_MEDIA_VIDEO_SOURCE_FPS", 24);
 const defaultVideoOutputFps = numberEnv("CODEX_MEDIA_VIDEO_OUTPUT_FPS", 24);
@@ -36,16 +41,94 @@ const enableVideoInterpolation = String(process.env.CODEX_MEDIA_VIDEO_INTERPOLAT
 const comfyBaseUrl = (process.env.COMFYUI_BASE_URL || "http://127.0.0.1:8188").replace(/\/$/, "");
 const comfyRoot = process.env.COMFYUI_ROOT || "E:\\ComfyUI";
 const defaultComfyImageWorkflow = process.env.COMFYUI_DEFAULT_IMAGE_WORKFLOW || "unsloth_qwen_image_2512";
+const lmStudioBaseUrl = (process.env.LMSTUDIO_BASE_URL || process.env.LOCAL_MODEL_BASE_URL || "http://127.0.0.1:1234").replace(/\/$/, "");
+const lmStudioApiToken = (process.env.LMSTUDIO_API_TOKEN || process.env.LM_API_TOKEN || "").trim();
+const lmStudioUnloadTimeoutMs = numberEnv("LMSTUDIO_UNLOAD_TIMEOUT_MS", 15000);
+const unloadLmStudioBeforeComfy = String(process.env.CODEX_MEDIA_UNLOAD_LMSTUDIO_BEFORE_COMFYUI || "true").toLowerCase() !== "false";
+const requireLmStudioUnloadBeforeComfy = String(process.env.CODEX_MEDIA_REQUIRE_LMSTUDIO_UNLOAD || "false").toLowerCase() === "true";
 const defaultComfyVideoWorkflow = process.env.COMFYUI_DEFAULT_VIDEO_WORKFLOW || "文生视频";
 const defaultComfyImageToVideoWorkflow = process.env.COMFYUI_DEFAULT_IMAGE_TO_VIDEO_WORKFLOW || "图生视频";
+const COMFY_CONTROL_AFTER_GENERATE_VALUES = new Set(["fixed", "increment", "decrement", "randomize"]);
+const COMFY_SCHEDULERS = new Set([
+  "simple",
+  "sgm_uniform",
+  "karras",
+  "exponential",
+  "ddim_uniform",
+  "beta",
+  "normal",
+  "linear_quadratic",
+  "kl_optimal"
+]);
+const COMFY_SAMPLERS = new Set([
+  "euler",
+  "euler_cfg_pp",
+  "euler_ancestral",
+  "euler_ancestral_cfg_pp",
+  "heun",
+  "heunpp2",
+  "exp_heun_2_x0",
+  "exp_heun_2_x0_sde",
+  "dpm_2",
+  "dpm_2_ancestral",
+  "lms",
+  "dpm_fast",
+  "dpm_adaptive",
+  "dpmpp_2s_ancestral",
+  "dpmpp_2s_ancestral_cfg_pp",
+  "dpmpp_sde",
+  "dpmpp_sde_gpu",
+  "dpmpp_2m",
+  "dpmpp_2m_cfg_pp",
+  "dpmpp_2m_sde",
+  "dpmpp_2m_sde_gpu",
+  "dpmpp_2m_sde_heun",
+  "dpmpp_2m_sde_heun_gpu",
+  "dpmpp_3m_sde",
+  "dpmpp_3m_sde_gpu",
+  "ddpm",
+  "lcm",
+  "ipndm",
+  "ipndm_v",
+  "deis",
+  "res_multistep",
+  "res_multistep_cfg_pp",
+  "res_multistep_ancestral",
+  "res_multistep_ancestral_cfg_pp",
+  "gradient_estimation",
+  "gradient_estimation_cfg_pp",
+  "er_sde",
+  "seeds_2",
+  "seeds_3",
+  "sa_solver",
+  "sa_solver_pece",
+  "ddim",
+  "uni_pc",
+  "uni_pc_bh2"
+]);
+const SKIP_WORKFLOW_PARAM = Symbol("skip workflow param");
 
 await fs.mkdir(outputRoot, { recursive: true });
 const releaseWorkerLock = once ? null : await acquireWorkerLock();
+let workflowSyncBusy = false;
 await ensureLifeAuth();
+if (workflowSyncEnabled) {
+  await syncComfyWorkflows().catch((error) => {
+    log(`Workflow sync failed: ${errorMessage(error)}`);
+  });
+}
 
 log(`Codex media worker started. life=${lifeBaseUrl} codex=${codexCommand}`);
 
 let deleteSweepBusy = false;
+if (!once && workflowSyncEnabled) {
+  setInterval(() => {
+    syncComfyWorkflows().catch((error) => {
+      log(`Workflow sync error: ${errorMessage(error)}`);
+    });
+  }, workflowSyncMs);
+}
+
 if (!once && !noDeleteSweeper) {
   setInterval(() => {
     sweepDeleteRequestedJob().catch((error) => {
@@ -89,7 +172,7 @@ async function acquireWorkerLock() {
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
     const existingPid = readWorkerLockPid(lockFile);
-    if (existingPid && isProcessRunning(existingPid)) {
+    if (existingPid && isWorkerProcessRunning(existingPid)) {
       log(`Another Codex media worker is already running (pid=${existingPid}). Exiting.`);
       process.exit(0);
     }
@@ -138,15 +221,70 @@ function readWorkerLockPid(lockFile) {
   }
 }
 
-function isProcessRunning(pid) {
+function isWorkerProcessRunning(pid) {
+  if (pid === process.pid) return true;
+  if (process.platform === "win32") {
+    return isWindowsWorkerProcess(pid);
+  }
   try {
-    process.kill(pid, 0);
-    return true;
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").toLowerCase();
+    return cmdline.includes("node") && cmdline.includes("codex-media-worker.js");
   } catch {
     return false;
   }
 }
 
+function isWindowsWorkerProcess(pid) {
+  const scriptPath = path.join(projectRoot, "scripts", "codex-media-worker.js").toLowerCase();
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
+    "if (-not $p) { exit 1 }",
+    "$name = [string]$p.Name",
+    "$cmd = ([string]$p.CommandLine).ToLowerInvariant()",
+    `$needle = '${scriptPath.replace(/'/g, "''")}'`,
+    "if ($name -ieq 'node.exe' -and $cmd.Contains($needle)) { exit 0 }",
+    "exit 1"
+  ].join("; ");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+    stdio: "ignore",
+    windowsHide: true
+  });
+  return result.status === 0;
+}
+
+async function syncComfyWorkflows() {
+  if (workflowSyncBusy) return false;
+  workflowSyncBusy = true;
+  try {
+    const workflows = await readLocalComfyWorkflowCatalog();
+    const result = await postJson(`${lifeBaseUrl}/api/codex-media/comfyui/workflows/sync`, {
+      source: "codexImages",
+      workerId,
+      bridgeUrl: codexImagesBaseUrl,
+      syncedAt: Date.now(),
+      workflows
+    });
+    log(`Synced ${result.synced ?? workflows.length} ComfyUI workflow(s) to life.`);
+    return true;
+  } finally {
+    workflowSyncBusy = false;
+  }
+}
+
+async function readLocalComfyWorkflowCatalog() {
+  const data = await getJsonWithoutAuth(`${codexImagesBaseUrl}/api/comfy/workflows`);
+  return Array.isArray(data.workflows) ? data.workflows : [];
+}
+
+async function getJsonWithoutAuth(url) {
+  const response = await fetch(url);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.success === false || data.ok === false) {
+    throw new Error(data.error || data.msg || `GET failed: ${response.status}`);
+  }
+  return data;
+}
 async function takePendingJob() {
   const data = await getJson(`${lifeBaseUrl}/api/codex-media/jobs?status=pending&limit=1`);
   const job = data.jobs?.[0];
@@ -154,7 +292,7 @@ async function takePendingJob() {
   await postJobProgress(job.request_id, {
     phase: "queued",
     progressText: "任务已领取，准备生成媒体。"
-  });
+  }, { required: true });
   return job;
 }
 
@@ -366,9 +504,10 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
   const mode = String(job.mode || "images").toLowerCase();
   const isImageVideo = mode === "image-video";
   const isVideo = isVideoMode(mode);
-  if (isImageVideo && !isValidDataImage(options.initImage?.dataUrl)) {
+  if (isImageVideo && !hasUsableInitImage(options.initImage)) {
     throw new Error("图生视频需要上传一张图片，且附件必须是图片文件。");
   }
+  await unloadLmStudioModelsForComfy(job);
   await postJobProgress(job.request_id, {
     phase: "comfyui_starting",
     progressText: "ComfyUI task queued locally."
@@ -383,31 +522,62 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
   const initImageName = isImageVideo ? await writeComfyInputImage(job, options.initImage) : "";
   const workflow = await loadComfyWorkflow(workflowName);
   const promptGraph = buildComfyPrompt(workflow, {
+    ...options,
     prompt: job.prompt || "",
-    filenamePrefix: `${safeSegment(job.request_id)}/output`,
+    filenamePrefix: `${comfyOutputSegment(job)}/output`,
     preserveWorkflowParams: true,
     isVideo,
+    durationSeconds: resolveExplicitComfyDurationSeconds(job, options),
     initImageName
   });
   await fs.writeFile(path.join(jobOutputDir, "comfyui-prompt.json"), JSON.stringify(promptGraph, null, 2), "utf8");
+  const progressMonitor = createComfyProgressMonitor(job);
+  const comfySubmittedAt = Date.now();
   const queued = await comfyFetch("/prompt", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: promptGraph, client_id: `life-${crypto.randomUUID()}` })
+    body: JSON.stringify({ prompt: promptGraph, client_id: progressMonitor.clientId })
   });
   const promptId = queued.prompt_id;
   if (!promptId) throw new Error("ComfyUI did not return a prompt_id.");
+  progressMonitor.setPromptId(promptId);
   log(`ComfyUI queued ${job.request_id}: ${promptId}`);
-  const historyItem = await waitForComfyHistory(promptId, job);
+  let historyItem;
+  try {
+    historyItem = await waitForComfyHistory(promptId, job, progressMonitor);
+  } finally {
+    progressMonitor.finish();
+  }
+  const comfyCompletedAt = Date.now();
   const outputs = isVideo ? collectComfyVideos(historyItem) : collectComfyImages(historyItem);
-  if (!outputs.length) throw new Error(`ComfyUI finished without ${isVideo ? "video" : "image"} outputs.`);
+  const savedAssets = outputs.length
+    ? await saveComfyHistoryOutputs(job, jobOutputDir, outputs.slice(0, 1), isVideo)
+    : await collectComfyOutputAssets(job, jobOutputDir, isVideo);
+  if (!savedAssets.length) throw new Error(`ComfyUI finished without ${isVideo ? "video" : "image"} outputs.`);
 
+  const assets = uploadToLife ? await uploadAssetsToLife(savedAssets) : savedAssets;
+  await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(job.request_id)}/complete`, {
+    resultText: `ComfyUI completed with workflow: ${workflowName}`,
+    notes: `ComfyUI completed in ${formatEta(Math.round((comfyCompletedAt - comfySubmittedAt) / 1000))}.`,
+    assets,
+    outputDir: jobOutputDir,
+    provider: "comfyui",
+    workflow: workflowName,
+    comfyPromptId: promptId,
+    comfyElapsedMs: comfyCompletedAt - comfySubmittedAt,
+    comfyExecutionElapsedMs: progressMonitor.executionStartedAt
+      ? comfyCompletedAt - progressMonitor.executionStartedAt
+      : 0
+  });
+  log(`Completed ${job.request_id} with ComfyUI (${assets.length} asset).`);
+}
+
+async function saveComfyHistoryOutputs(job, jobOutputDir, outputs, isVideo) {
   const savedAssets = [];
-  const finalOutputs = outputs.slice(0, 1);
-  for (const output of finalOutputs) {
+  for (const output of outputs) {
     const buffer = await downloadComfyFile(output);
     const fallbackExt = isVideo ? ".mp4" : ".png";
-    const ext = path.extname(output.filename || "").toLowerCase() || fallbackExt;
+    const ext = path.extname(output.filename || output.name || "").toLowerCase() || fallbackExt;
     const fileName = isVideo ? `clip-0001${ext}` : `frame-0001${ext}`;
     const filePath = path.join(jobOutputDir, fileName);
     await fs.writeFile(filePath, buffer);
@@ -421,16 +591,45 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
       comfy: output
     });
   }
+  return savedAssets;
+}
 
-  const assets = uploadToLife ? await uploadAssetsToLife(savedAssets) : savedAssets;
-  await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(job.request_id)}/complete`, {
-    resultText: `ComfyUI completed with workflow: ${workflowName}`,
-    assets,
-    outputDir: jobOutputDir,
-    provider: "comfyui",
-    workflow: workflowName
-  });
-  log(`Completed ${job.request_id} with ComfyUI (${assets.length} asset).`);
+async function collectComfyOutputAssets(job, jobOutputDir, isVideo) {
+  const requestId = safeSegment(job.request_id || "");
+  const outputSegment = comfyOutputSegment(job);
+  const outputDir = path.join(comfyRoot, "output");
+  const scopedNames = Array.from(new Set([outputSegment, requestId].filter(Boolean)));
+  const files = [];
+  for (const scopedName of scopedNames) {
+    const scopedDir = path.join(outputDir, scopedName);
+    if (await pathExists(scopedDir)) {
+      files.push(...await listFilesRecursive(scopedDir));
+    }
+  }
+  if (!files.length && await pathExists(outputDir)) {
+    const all = await listFilesRecursive(outputDir, 3);
+    files.push(...all.filter(file => scopedNames.some(scopedName => file.includes(scopedName))));
+  }
+  const pattern = isVideo
+    ? /\.(mp4|webm|mov|m4v|avi|mkv|gif|apng)$/i
+    : /\.(png|jpe?g|webp|gif)$/i;
+  const candidates = files.filter(file => pattern.test(file)).sort();
+  if (!candidates.length) return [];
+  const source = candidates[candidates.length - 1];
+  const ext = path.extname(source).toLowerCase() || (isVideo ? ".mp4" : ".png");
+  const fileName = isVideo ? `clip-0001${ext}` : `frame-0001${ext}`;
+  const targetPath = path.join(jobOutputDir, fileName);
+  await fs.copyFile(source, targetPath);
+  const stat = await fs.stat(targetPath);
+  log(`Recovered ComfyUI ${isVideo ? "video" : "image"} output from ${source}`);
+  return [{
+    fileName,
+    path: targetPath,
+    size: stat.size,
+    url: buildLocalAssetUrl(jobOutputDir, fileName),
+    localUrl: buildLocalAssetUrl(jobOutputDir, fileName),
+    comfyRecoveredFrom: source
+  }];
 }
 
 function buildCodexPrompt(job, outputDir, frameSegment = null, videoSettings = null) {
@@ -683,7 +882,7 @@ async function collectAssets(dir) {
   const assetNames = files
     .filter(file => file.isFile())
     .map(file => file.name)
-    .filter(name => /\.(png|jpe?g|webp|gif|mp4)$/i.test(name))
+    .filter(name => /\.(png|jpe?g|webp|gif|mp4|webm|mov|m4v|avi|mkv)$/i.test(name))
     .sort();
   const assets = [];
   for (const name of assetNames) {
@@ -700,6 +899,30 @@ async function collectAssets(dir) {
   return assets;
 }
 
+async function pathExists(target) {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listFilesRecursive(dir, maxDepth = 8) {
+  if (maxDepth < 0) return [];
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const files = [];
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isFile()) {
+      files.push(fullPath);
+    } else if (entry.isDirectory()) {
+      files.push(...await listFilesRecursive(fullPath, maxDepth - 1));
+    }
+  }
+  return files;
+}
+
 async function uploadAssetsToLife(assets) {
   const uploaded = [];
   for (const asset of assets) {
@@ -714,6 +937,9 @@ async function uploadAssetsToLife(assets) {
         throw new Error(data.message || `upload failed: ${response.status}`);
       }
       const downloadId = data.data?.downloadId || "";
+      if (!downloadId) {
+        throw new Error("upload succeeded but no downloadId was returned");
+      }
       uploaded.push({
         ...asset,
         downloadId,
@@ -722,11 +948,9 @@ async function uploadAssetsToLife(assets) {
         playUrl: downloadId ? `${publicLifeBaseUrl}/download/play?id=${encodeURIComponent(downloadId)}` : ""
       });
     } catch (error) {
-      uploaded.push({
-        ...asset,
-        uploaded: false,
-        uploadError: errorMessage(error)
-      });
+      const message = `Upload to life failed for ${asset.fileName || asset.path || "asset"}: ${errorMessage(error)}`;
+      log(message);
+      throw new Error(message);
     }
   }
   return uploaded;
@@ -760,16 +984,14 @@ function convertComfyUiWorkflow(workflow) {
   for (const node of workflow.nodes || []) {
     if (!node || node.mode === 2 || node.type === "Note") continue;
     const inputs = {};
+    const widgetValues = normalizedComfyUiWidgetValues(node);
     let widgetIndex = 0;
     for (const input of node.inputs || []) {
       if (input.link != null) {
         const link = links.get(input.link);
         if (link) inputs[input.name] = [String(link[1]), link[2]];
       } else if (input.widget?.name) {
-        if (node.type === "KSampler" && input.widget.name === "steps" && typeof node.widgets_values?.[widgetIndex] === "string") {
-          widgetIndex += 1;
-        }
-        inputs[input.widget.name] = node.widgets_values?.[widgetIndex];
+        inputs[input.widget.name] = widgetValues[widgetIndex];
         widgetIndex += 1;
       }
     }
@@ -781,10 +1003,37 @@ function convertComfyUiWorkflow(workflow) {
   return graph;
 }
 
+function normalizedComfyUiWidgetValues(node) {
+  const values = Array.isArray(node?.widgets_values) ? node.widgets_values.slice() : [];
+  if (!isKSamplerNodeType(node?.type) || values.length < 2) return values;
+  const widgetNames = (node.inputs || [])
+    .filter(input => input?.link == null && input?.widget?.name)
+    .map(input => input.widget.name);
+  if (
+    widgetNames.includes("seed") &&
+    widgetNames.includes("steps") &&
+    !widgetNames.includes("control_after_generate") &&
+    isControlAfterGenerateValue(values[1])
+  ) {
+    values.splice(1, 1);
+  }
+  return values;
+}
+
+function isKSamplerNodeType(type) {
+  return type === "KSampler" || type === "KSamplerAdvanced";
+}
+
+function isControlAfterGenerateValue(value) {
+  return typeof value === "string" && COMFY_CONTROL_AFTER_GENERATE_VALUES.has(value.trim().toLowerCase());
+}
+
 function patchComfyPrompt(apiPrompt, options) {
   const [width, height] = parseSize(options.size);
   const isVideo = Boolean(options.isVideo);
   const preserveWorkflowParams = Boolean(options.preserveWorkflowParams);
+  const workflowParams = isPlainObject(options.workflowParams) ? options.workflowParams : {};
+  const durationFrames = isVideo ? computeComfyDurationFrames(apiPrompt, options) : 0;
   const textNodeIds = Object.entries(apiPrompt)
     .filter(([, node]) => node.class_type === "CLIPTextEncode" && "text" in node.inputs)
     .map(([nodeId]) => nodeId);
@@ -804,7 +1053,19 @@ function patchComfyPrompt(apiPrompt, options) {
     if (!preserveWorkflowParams && node.class_type === "LTXVConditioning" && "frame_rate" in node.inputs) node.inputs.frame_rate = options.fps || 24;
     if (!preserveWorkflowParams && isVideo && (node.class_type === "INTConstant" || node.class_type === "PrimitiveInt") && "value" in node.inputs) node.inputs.value = options.frames || node.inputs.value;
     if (!preserveWorkflowParams && isVideo && (node.class_type === "FloatConstant" || node.class_type === "PrimitiveFloat") && "value" in node.inputs) node.inputs.value = options.fps || node.inputs.value;
-    if (node.class_type === "LoadImage" && options.initImageName && "image" in node.inputs) node.inputs.image = options.initImageName;
+    if (durationFrames > 0 && isVideoFrameCountNode(node)) {
+      for (const field of ["length", "frames", "num_frames", "frame_count", "video_length"]) {
+        if (field in node.inputs) node.inputs[field] = durationFrames;
+      }
+    }
+    applyExplicitWorkflowParams(nodeId, node, workflowParams);
+    if (node.class_type === "LoadImage" && options.initImageName && "image" in node.inputs) {
+      node.inputs.image = options.initImageName;
+    }
+    if (node.class_type === "CLIPTextEncode" && "text" in node.inputs && (options.prompt != null || options.negativePrompt != null)) {
+      if (nodeId === "6" || title.includes("positive") || nodeId === textNodeIds[0]) node.inputs.text = options.prompt || "";
+      if (nodeId === "7" || title.includes("negative") || nodeId === textNodeIds[1]) node.inputs.text = options.negativePrompt || "";
+    }
     if (!preserveWorkflowParams && (node.class_type === "KSampler" || node.class_type === "KSamplerAdvanced")) {
       if ("seed" in node.inputs) node.inputs.seed = options.seed;
       if ("steps" in node.inputs) node.inputs.steps = options.steps || node.inputs.steps;
@@ -816,7 +1077,125 @@ function patchComfyPrompt(apiPrompt, options) {
   }
 }
 
-async function waitForComfyHistory(promptId, job) {
+function applyExplicitWorkflowParams(nodeId, node, workflowParams) {
+  if (!isPlainObject(workflowParams) || !node || !isPlainObject(node.inputs)) return;
+  const prefix = `${nodeId}.`;
+  for (const [key, value] of Object.entries(workflowParams)) {
+    const text = String(key || "");
+    if (!text.startsWith(prefix)) continue;
+    const inputName = text.slice(prefix.length);
+    if (!inputName || !(inputName in node.inputs) || value === undefined || value === null) continue;
+    const sanitizedValue = sanitizeExplicitWorkflowParamValue(node, inputName, value, workflowParams);
+    if (sanitizedValue === SKIP_WORKFLOW_PARAM) continue;
+    node.inputs[inputName] = sanitizedValue;
+  }
+}
+
+function sanitizeExplicitWorkflowParamValue(node, inputName, value, workflowParams = {}) {
+  if (node.class_type === "CFGNorm" && inputName === "strength") {
+    const strength = Number(value);
+    const cfg = Number(workflowParams?.cfg);
+    if (Number.isFinite(strength) && Number.isFinite(cfg) && strength === cfg && strength > 2) return SKIP_WORKFLOW_PARAM;
+  }
+  if (node.class_type !== "KSampler" && node.class_type !== "KSamplerAdvanced") return value;
+  if (inputName === "seed" || inputName === "noise_seed") {
+    const seed = Number(value);
+    if (!Number.isFinite(seed)) return SKIP_WORKFLOW_PARAM;
+    return seed < 0 ? randomSeed() : Math.floor(seed);
+  }
+  if (["steps", "start_at_step", "end_at_step"].includes(inputName)) {
+    const number = Number(value);
+    const min = inputName === "steps" ? 1 : 0;
+    if (!Number.isFinite(number) || number < min) return SKIP_WORKFLOW_PARAM;
+    return Math.floor(number);
+  }
+  if (inputName === "cfg" || inputName === "denoise") {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return SKIP_WORKFLOW_PARAM;
+    return number;
+  }
+  if (inputName === "sampler_name") {
+    if (typeof value !== "string") return SKIP_WORKFLOW_PARAM;
+    const sampler = value.trim();
+    if (!sampler) return SKIP_WORKFLOW_PARAM;
+    return COMFY_SCHEDULERS.has(sampler) && !COMFY_SAMPLERS.has(sampler) ? SKIP_WORKFLOW_PARAM : sampler;
+  }
+  if (inputName === "scheduler") {
+    if (typeof value !== "string") return SKIP_WORKFLOW_PARAM;
+    const scheduler = value.trim();
+    return COMFY_SCHEDULERS.has(scheduler) ? scheduler : SKIP_WORKFLOW_PARAM;
+  }
+  return value;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveExplicitComfyDurationSeconds(job, options = {}) {
+  if (isTruthy(options.durationSpecified) && Number.isFinite(Number(options.durationSeconds))) {
+    return clampComfyDurationSeconds(Number(options.durationSeconds));
+  }
+  const prompt = String(job?.prompt || "");
+  const rangeMatch = prompt.match(/(\d+(?:\.\d+)?)\s*(?:~|-|\u5230|\u81f3|to)\s*(\d+(?:\.\d+)?)\s*(?:\u79d2|s|sec|second|seconds)?/i);
+  if (rangeMatch) return clampComfyDurationSeconds(Number(rangeMatch[2]));
+  const match = prompt.match(/(\d+(?:\.\d+)?)\s*(?:\u79d2|s|sec|second|seconds)/i);
+  return match ? clampComfyDurationSeconds(Number(match[1])) : 0;
+}
+
+function computeComfyDurationFrames(apiPrompt, options = {}) {
+  const seconds = Number(options.durationSeconds || 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  const fps = findComfyWorkflowFps(apiPrompt);
+  return clampInteger(seconds * fps, 1, 4096, 0);
+}
+
+function findComfyWorkflowFps(apiPrompt) {
+  const nodes = Object.values(apiPrompt || {});
+  for (const className of ["CreateVideo", "VHS_VideoCombine"]) {
+    const found = firstNodeInputNumber(nodes, className, ["fps", "frame_rate"]);
+    if (Number.isFinite(found)) return clampInteger(found, 1, 120, 24);
+  }
+  const conditioningFps = firstNodeInputNumber(nodes, "LTXVConditioning", ["frame_rate", "fps"]);
+  if (Number.isFinite(conditioningFps)) return clampInteger(conditioningFps, 1, 120, 24);
+  for (const node of nodes) {
+    const generic = firstInputNumber(node, ["fps", "frame_rate"]);
+    if (Number.isFinite(generic)) return clampInteger(generic, 1, 120, 24);
+  }
+  return 24;
+}
+
+function firstNodeInputNumber(nodes, className, fields) {
+  const node = nodes.find(item => item?.class_type === className);
+  return node ? firstInputNumber(node, fields) : NaN;
+}
+
+function firstInputNumber(node, fields) {
+  for (const field of fields) {
+    const value = Number(node?.inputs?.[field]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return NaN;
+}
+
+function isVideoFrameCountNode(node) {
+  const className = String(node?.class_type || "");
+  if (!/video/i.test(className) || !/latent/i.test(className)) return false;
+  return ["length", "frames", "num_frames", "frame_count", "video_length"].some(field => field in (node.inputs || {}));
+}
+
+function clampComfyDurationSeconds(value) {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.max(1, Math.min(60, value));
+}
+
+function isTruthy(value) {
+  if (value === true) return true;
+  const text = String(value || "").trim().toLowerCase();
+  return text === "true" || text === "1" || text === "yes";
+}
+
+async function waitForComfyHistory(promptId, job, progressMonitor = null) {
   const startedAt = Date.now();
   const timeoutMs = Number(process.env.COMFYUI_TIMEOUT_MS || 30 * 60 * 1000);
   while (Date.now() - startedAt < timeoutMs) {
@@ -825,9 +1204,14 @@ async function waitForComfyHistory(promptId, job) {
     const item = history?.[promptId];
     if (item?.status?.status_str === "error") throw new Error(`ComfyUI failed prompt ${promptId}.`);
     if (item?.outputs) return item;
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
     await postJobProgress(job.request_id, {
       phase: "comfyui_running",
-      progressText: "ComfyUI is generating..."
+      progressLabel: "ComfyUI 生成中",
+      progressText: progressMonitor?.lastProgressText || `ComfyUI is generating...\n已运行 ${formatEta(elapsedSeconds)}`,
+      progressPercent: progressMonitor?.lastPercent || 16,
+      comfyPromptId: promptId,
+      comfyElapsedMs: Date.now() - startedAt
     });
   }
   throw new Error(`ComfyUI timed out waiting for ${promptId}.`);
@@ -844,15 +1228,28 @@ function collectComfyImages(historyItem) {
 function collectComfyVideos(historyItem) {
   const videos = [];
   for (const output of Object.values(historyItem.outputs || {})) {
-    for (const video of output.videos || []) videos.push(video);
-    for (const gif of output.gifs || []) videos.push(gif);
+    for (const value of Object.values(output || {})) {
+      const items = Array.isArray(value) ? value : [value];
+      for (const item of items) {
+        if (isComfyVideoOutput(item)) videos.push(item);
+      }
+    }
   }
   return videos;
 }
 
+function isComfyVideoOutput(item) {
+  if (!item || typeof item !== "object") return false;
+  const filename = String(item.filename || item.name || "");
+  const mediaType = String(item.type || item.format || item.mime || item.contentType || "");
+  return /\.(mp4|webm|mov|m4v|avi|mkv|gif|apng)$/i.test(filename) || /video|animated/i.test(mediaType);
+}
+
 async function downloadComfyFile(file) {
+  const filename = file.filename || file.name || "";
+  if (!filename) throw new Error("ComfyUI output did not include a filename.");
   const params = new URLSearchParams({
-    filename: file.filename,
+    filename,
     subfolder: file.subfolder || "",
     type: file.type || "output"
   });
@@ -874,18 +1271,264 @@ async function comfyFetch(endpoint, options = {}) {
   return data;
 }
 
+function createComfyProgressMonitor(job) {
+  const clientId = `life-${crypto.randomUUID()}`;
+  const state = {
+    clientId,
+    promptId: "",
+    submittedAt: Date.now(),
+    executionStartedAt: 0,
+    lastPostedAt: 0,
+    lastPercent: 0,
+    lastProgressText: "",
+    ws: null,
+    setPromptId(promptId) {
+      state.promptId = promptId || "";
+    },
+    finish() {
+      try {
+        state.ws?.close();
+      } catch {
+        // Best effort.
+      }
+    }
+  };
+  if (typeof WebSocket === "undefined") {
+    return state;
+  }
+  try {
+    const ws = new WebSocket(comfyWebSocketUrl(clientId));
+    state.ws = ws;
+    ws.addEventListener("message", (event) => {
+      handleComfySocketMessage(state, job, event.data).catch((error) => {
+        log(`ComfyUI progress message failed for ${job.request_id}: ${errorMessage(error)}`);
+      });
+    });
+    ws.addEventListener("error", () => {
+      // Polling progress remains available if the socket is unavailable.
+    });
+  } catch (error) {
+    log(`ComfyUI progress socket unavailable for ${job.request_id}: ${errorMessage(error)}`);
+  }
+  return state;
+}
+
+function comfyWebSocketUrl(clientId) {
+  const base = new URL(comfyBaseUrl);
+  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+  base.pathname = "/ws";
+  base.search = `?clientId=${encodeURIComponent(clientId)}`;
+  return base.toString();
+}
+
+async function handleComfySocketMessage(state, job, raw) {
+  let dataText = "";
+  if (typeof raw === "string") {
+    dataText = raw;
+  } else if (raw instanceof ArrayBuffer) {
+    dataText = Buffer.from(raw).toString("utf8");
+  } else if (ArrayBuffer.isView(raw)) {
+    dataText = Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString("utf8");
+  } else if (raw?.arrayBuffer) {
+    dataText = Buffer.from(await raw.arrayBuffer()).toString("utf8");
+  } else {
+    return;
+  }
+  const event = JSON.parse(dataText);
+  const type = String(event?.type || "");
+  const data = event?.data || {};
+  const promptId = String(data.prompt_id || data.promptId || "");
+  if (promptId && state.promptId && promptId !== state.promptId) return;
+
+  if (type === "execution_start") {
+    state.executionStartedAt = Date.now();
+    await postComfySocketProgress(state, job, {
+      percent: 8,
+      text: "ComfyUI 已开始执行工作流。"
+    }, true);
+    return;
+  }
+
+  if (type === "progress") {
+    const value = Number(data.value || 0);
+    const max = Number(data.max || 0);
+    if (!Number.isFinite(value) || !Number.isFinite(max) || max <= 0) return;
+    const elapsedSeconds = Math.max(0, (Date.now() - (state.executionStartedAt || state.submittedAt)) / 1000);
+    const secondsPerStep = value > 0 ? elapsedSeconds / value : 0;
+    const remainingSeconds = value > 0 ? Math.max(0, secondsPerStep * (max - value)) : 0;
+    const percent = Math.max(8, Math.min(98, Math.round((value / max) * 100)));
+    const stepRate = secondsPerStep > 0 ? `，${secondsPerStep.toFixed(2)}s/it` : "";
+    const text = [
+      `ComfyUI 采样进度：${value} / ${max}`,
+      `已运行 ${formatEta(Math.round(elapsedSeconds))}，约剩余 ${formatEta(Math.round(remainingSeconds))}${stepRate}`
+    ].join("\n");
+    await postComfySocketProgress(state, job, {
+      percent,
+      text,
+      value,
+      max,
+      elapsedSeconds,
+      remainingSeconds,
+      secondsPerStep
+    });
+    return;
+  }
+
+  if (type === "executing" && data.node === null) {
+    await postComfySocketProgress(state, job, {
+      percent: 98,
+      text: "ComfyUI 已完成执行，正在收集输出文件。"
+    }, true);
+  }
+}
+
+async function postComfySocketProgress(state, job, progress, force = false) {
+  const now = Date.now();
+  if (!force && now - state.lastPostedAt < 1500) return;
+  state.lastPostedAt = now;
+  state.lastPercent = progress.percent || state.lastPercent || 0;
+  state.lastProgressText = progress.text || state.lastProgressText || "";
+  await postJobProgress(job.request_id, {
+    phase: "comfyui_running",
+    progressLabel: "ComfyUI 生成中",
+    progressText: state.lastProgressText,
+    progressPercent: state.lastPercent,
+    comfyPromptId: state.promptId,
+    comfyElapsedMs: now - state.submittedAt,
+    comfyExecutionElapsedMs: state.executionStartedAt ? now - state.executionStartedAt : 0,
+    comfyProgress: {
+      value: progress.value || 0,
+      max: progress.max || 0,
+      elapsedSeconds: progress.elapsedSeconds || 0,
+      remainingSeconds: progress.remainingSeconds || 0,
+      secondsPerStep: progress.secondsPerStep || 0
+    }
+  });
+}
+
+async function unloadLmStudioModelsForComfy(job) {
+  if (!unloadLmStudioBeforeComfy) return [];
+  try {
+    const loadedInstances = await listLmStudioLoadedInstances();
+    if (!loadedInstances.length) {
+      log(`LM Studio unload skipped before ComfyUI ${job.request_id}: no loaded model instances.`);
+      return [];
+    }
+    await postJobProgress(job.request_id, {
+      phase: "lmstudio_unloading",
+      progressText: `Unloading ${loadedInstances.length} local LM Studio model instance(s) before ComfyUI.`
+    });
+    const unloaded = [];
+    for (const instance of loadedInstances) {
+      await unloadLmStudioInstance(instance.id);
+      unloaded.push(instance);
+    }
+    log(`LM Studio unloaded before ComfyUI ${job.request_id}: ${unloaded.map(item => item.id).join(", ")}`);
+    await postJobProgress(job.request_id, {
+      phase: "lmstudio_unloaded",
+      progressText: `Unloaded ${unloaded.length} local LM Studio model instance(s) before ComfyUI.`
+    });
+    return unloaded;
+  } catch (error) {
+    const message = `LM Studio unload before ComfyUI failed: ${errorMessage(error)}`;
+    log(`${message} request=${job.request_id}`);
+    if (requireLmStudioUnloadBeforeComfy) throw new Error(message);
+    await postJobProgress(job.request_id, {
+      phase: "lmstudio_unload_skipped",
+      progressText: `${message}. Continuing because CODEX_MEDIA_REQUIRE_LMSTUDIO_UNLOAD is not true.`
+    });
+    return [];
+  }
+}
+
+async function listLmStudioLoadedInstances() {
+  const data = await lmStudioFetch("/api/v1/models");
+  const models = Array.isArray(data.models) ? data.models : [];
+  const instances = [];
+  for (const model of models) {
+    const loaded = Array.isArray(model?.loaded_instances) ? model.loaded_instances : [];
+    for (const instance of loaded) {
+      const id = String(instance?.id || "").trim();
+      if (!id) continue;
+      instances.push({
+        id,
+        modelKey: String(model?.key || "").trim(),
+        type: String(model?.type || "").trim()
+      });
+    }
+  }
+  return instances;
+}
+
+async function unloadLmStudioInstance(instanceId) {
+  return lmStudioFetch("/api/v1/models/unload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instance_id: instanceId })
+  });
+}
+
+async function lmStudioFetch(endpoint, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), lmStudioUnloadTimeoutMs);
+  try {
+    const headers = { ...(options.headers || {}) };
+    if (lmStudioApiToken) headers.Authorization = `Bearer ${lmStudioApiToken}`;
+    const response = await fetch(`${lmStudioBaseUrl}${endpoint}`, {
+      ...options,
+      headers,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
+    }
+    if (!response.ok) {
+      throw new Error(data.error?.message || data.raw || `LM Studio request failed: ${response.status}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function writeComfyInputImage(job, initImage) {
-  if (!isValidDataImage(initImage?.dataUrl)) throw new Error("图生视频需要上传一张图片，且附件必须是图片文件。");
-  const match = String(initImage.dataUrl).match(/^data:([^;]+);base64,(.+)$/);
-  const mime = match[1].toLowerCase();
-  const ext = mime.includes("jpeg") ? ".jpg" : mime.includes("webp") ? ".webp" : ".png";
-  const fileName = `life-${safeSegment(job.request_id)}${ext}`;
+  const input = await readInitImageBuffer(initImage);
+  const fileName = `input-${comfyOutputSegment(job)}${input.ext}`;
   const targetDir = path.join(comfyRoot, "input");
   const targetPath = path.join(targetDir, fileName);
   if (!targetPath.startsWith(targetDir)) throw new Error("Invalid ComfyUI input path.");
   await fs.mkdir(targetDir, { recursive: true });
-  await fs.writeFile(targetPath, Buffer.from(match[2], "base64"));
+  await fs.writeFile(targetPath, input.buffer);
   return fileName;
+}
+
+async function readInitImageBuffer(initImage) {
+  if (!hasUsableInitImage(initImage)) {
+    throw new Error("图生视频需要上传一张图片，且附件必须是图片文件。");
+  }
+  if (isValidDataImage(initImage?.dataUrl)) {
+    const match = String(initImage.dataUrl).match(/^data:([^;]+);base64,(.+)$/i);
+    const mime = String(match?.[1] || "image/png").toLowerCase();
+    return {
+      buffer: Buffer.from(match?.[2] || "", "base64"),
+      ext: imageExtensionFromMime(mime)
+    };
+  }
+
+  const imagePath = String(initImage?.filePath || initImage?.path || initImage?.localPath || "").trim();
+  if (imagePath) {
+    const ext = imageExtensionFromName(imagePath, initImage?.type);
+    return {
+      buffer: await fs.readFile(path.resolve(imagePath)),
+      ext
+    };
+  }
+
+  throw new Error("图生视频需要上传一张图片，且附件必须是图片文件。");
 }
 
 function resolveDeleteTargets(job) {
@@ -956,7 +1599,7 @@ function authHeaders(extra = {}) {
   return headers;
 }
 
-async function postJobProgress(requestId, progress) {
+async function postJobProgress(requestId, progress, options = {}) {
   if (!requestId) return;
   const payload = {
     ...progress,
@@ -964,6 +1607,7 @@ async function postJobProgress(requestId, progress) {
   };
   await postJson(`${lifeBaseUrl}/api/codex-media/jobs/${encodeURIComponent(requestId)}/running`, payload).catch((error) => {
     log(`Progress update failed for ${requestId}: ${errorMessage(error)}`);
+    if (options.required) throw error;
   });
 }
 
@@ -1020,18 +1664,28 @@ function formatEta(seconds) {
 
 async function ensureLifeAuth() {
   if (lifeAccessToken || !lifeAccessKey) return;
-  const response = await fetch(`${lifeBaseUrl}/api/access/verify`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ key: lifeAccessKey })
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.success === false) {
-    throw new Error(data.error || `access verify failed: ${response.status}`);
-  }
-  lifeAccessToken = String(data.auth?.accessToken || "").trim();
-  if (!lifeAccessToken) {
-    throw new Error("access verify succeeded but no session token was returned.");
+  while (!lifeAccessToken) {
+    try {
+      const response = await fetch(`${lifeBaseUrl}/api/access/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: lifeAccessKey })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.success === false) {
+        const error = new Error(data.error || `access verify failed: ${response.status}`);
+        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw error;
+      }
+      lifeAccessToken = String(data.auth?.accessToken || "").trim();
+      if (!lifeAccessToken) {
+        throw new Error("access verify succeeded but no session token was returned.");
+      }
+    } catch (error) {
+      if (error?.retryable === false) throw error;
+      log(`Life auth unavailable: ${errorMessage(error)}. Retrying in ${Math.round(authRetryMs / 1000)}s.`);
+      await sleep(authRetryMs);
+    }
   }
 }
 
@@ -1083,6 +1737,11 @@ function contentType(fileName) {
   if (lower.endsWith(".webp")) return "image/webp";
   if (lower.endsWith(".gif")) return "image/gif";
   if (lower.endsWith(".mp4")) return "video/mp4";
+  if (lower.endsWith(".webm")) return "video/webm";
+  if (lower.endsWith(".mov")) return "video/quicktime";
+  if (lower.endsWith(".m4v")) return "video/x-m4v";
+  if (lower.endsWith(".avi")) return "video/x-msvideo";
+  if (lower.endsWith(".mkv")) return "video/x-matroska";
   return "application/octet-stream";
 }
 
@@ -1110,8 +1769,45 @@ function isComfyProvider(options = {}) {
   return String(options.provider || options.mediaProvider || "").toLowerCase() === "comfyui";
 }
 
+function comfyOutputSegment(job) {
+  const requestId = safeSegment(job?.request_id || "");
+  if (!requestId) return "comfyui-media-job";
+  if (/^comfyui-/i.test(requestId)) return requestId;
+  if (/^codex-media-/i.test(requestId)) return requestId.replace(/^codex-media-/i, "comfyui-media-");
+  return `comfyui-${requestId}`;
+}
+
 function isValidDataImage(dataUrl) {
   return /^data:image\/(?:png|jpe?g|webp|gif);base64,/i.test(String(dataUrl || ""));
+}
+
+function hasUsableInitImage(initImage) {
+  if (isValidDataImage(initImage?.dataUrl)) return true;
+  const imagePath = String(initImage?.filePath || initImage?.path || initImage?.localPath || "").trim();
+  if (!imagePath) return false;
+  return isImageExtension(path.extname(imagePath)) || isImageMime(initImage?.type);
+}
+
+function imageExtensionFromName(fileName, mime = "") {
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  if (isImageExtension(ext)) return ext === ".jpeg" ? ".jpg" : ext;
+  return imageExtensionFromMime(mime);
+}
+
+function imageExtensionFromMime(mime) {
+  const value = String(mime || "").toLowerCase();
+  if (value.includes("jpeg") || value.includes("jpg")) return ".jpg";
+  if (value.includes("webp")) return ".webp";
+  if (value.includes("gif")) return ".gif";
+  return ".png";
+}
+
+function isImageExtension(ext) {
+  return /\.(?:png|jpe?g|webp|gif)$/i.test(String(ext || ""));
+}
+
+function isImageMime(mime) {
+  return /^image\/(?:png|jpe?g|webp|gif)$/i.test(String(mime || ""));
 }
 
 function normalizeComfySize(value) {
@@ -1350,3 +2046,4 @@ function resolveFfmpegCommand() {
   }
   return "";
 }
+

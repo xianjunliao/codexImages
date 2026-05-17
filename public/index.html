@@ -24,33 +24,44 @@
       </label>
 
       <label class="field">
-        <span>Mode</span>
-        <select id="modeInput">
-          <option value="images">Images</option>
-          <option value="video">Sora video</option>
-          <option value="both">Images + video</option>
+        <span>Provider</span>
+        <select id="providerInput">
+          <option value="comfyui">ComfyUI</option>
+          <option value="openai">OpenAI</option>
         </select>
       </label>
 
       <label class="field">
-        <span>Images</span>
-        <input id="imageCountInput" type="number" min="1" max="96" value="6">
+        <span>Workflow</span>
+        <select id="comfyWorkflowSelect"></select>
+      </label>
+
+      <label class="field">
+        <span>Mode</span>
+        <select id="modeInput">
+          <option value="images">Image</option>
+          <option value="video">Text video</option>
+          <option value="image-video">Image video</option>
+        </select>
       </label>
 
       <label class="field">
         <span>Size</span>
-        <select id="sizeInput">
+        <input id="sizeInput" type="text" list="sizeOptions" value="1024x1024">
+        <datalist id="sizeOptions">
           <option value="720x1280">720x1280</option>
           <option value="1024x1792">1024x1792</option>
           <option value="1024x1024">1024x1024</option>
           <option value="1024x1536">1024x1536</option>
           <option value="1536x1024">1536x1024</option>
           <option value="1280x720">1280x720</option>
+          <option value="1280x736">1280x736</option>
+          <option value="768x1024">768x1024</option>
           <option value="1792x1024">1792x1024</option>
-        </select>
+        </datalist>
       </label>
 
-      <label class="field">
+      <label class="field" id="qualityField">
         <span>Quality</span>
         <select id="qualityInput">
           <option value="medium">Medium</option>
@@ -60,7 +71,7 @@
         </select>
       </label>
 
-      <label class="field">
+      <label class="field" id="secondsField">
         <span>Seconds</span>
         <select id="secondsInput">
           <option value="4">4</option>
@@ -69,19 +80,28 @@
         </select>
       </label>
 
-      <label class="check-field">
-        <input id="continuousInput" type="checkbox">
-        <span>Continuous</span>
+      <label class="field" id="fpsField">
+        <span>FPS</span>
+        <input id="videoFpsInput" type="number" min="1" max="60" value="24">
       </label>
 
-      <label class="check-field">
-        <input id="stitchVideoInput" type="checkbox">
-        <span>Stitch MP4</span>
+      <label class="field" id="framesField">
+        <span>Frames</span>
+        <input id="videoFramesInput" type="number" min="1" max="300" value="73">
+      </label>
+
+      <label class="field">
+        <span>Steps</span>
+        <input id="stepsInput" type="number" min="1" max="150" value="20">
+      </label>
+
+      <label class="field field-full" id="initImageField">
+        <span>Input image</span>
+        <input id="initImageInput" type="file" accept="image/*">
       </label>
 
       <div class="actions">
         <button class="primary-button" type="submit">Start</button>
-        <button id="extendButton" type="button" disabled>Extend</button>
         <button id="stopButton" type="button" disabled>Stop</button>
       </div>
     </form>

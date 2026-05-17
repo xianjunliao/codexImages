@@ -4,8 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1",
+    "server": "node server.js",
+    "start:web": "node server.js",
     "dev": "node server.js",
+    "services": "powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1",
+    "start:all": "powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1",
     "worker": "node scripts/codex-media-worker.js",
     "worker:once": "node scripts/codex-media-worker.js --once",
     "startup:install": "powershell -ExecutionPolicy Bypass -File scripts/install-startup-task.ps1",
