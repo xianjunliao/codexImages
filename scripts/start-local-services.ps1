@@ -54,6 +54,45 @@ function Test-PortListening {
     }
 }
 
+function Stop-PortListeners {
+    param(
+        [int]$Port,
+        [int]$WaitSeconds = 10
+    )
+    $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    if ($connections.Count -eq 0) {
+        return $true
+    }
+
+    $pids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -and $_ -ne $PID })
+    if ($pids.Count -eq 0) {
+        Write-ServiceLog "Port $Port is busy, but no killable listener process was found."
+        return $false
+    }
+
+    foreach ($listenerPid in $pids) {
+        try {
+            $process = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+            $processName = if ($process) { $process.ProcessName } else { "unknown" }
+            Write-ServiceLog "Port $Port is busy. Stopping PID $listenerPid ($processName)."
+            Stop-Process -Id $listenerPid -Force -ErrorAction Stop
+        } catch {
+            Write-ServiceLog ("Failed to stop PID $listenerPid on port ${Port}: " + $_.Exception.Message)
+        }
+    }
+
+    for ($i = 0; $i -lt $WaitSeconds; $i++) {
+        Start-Sleep -Seconds 1
+        if (-not (Test-PortListening -Port $Port)) {
+            Write-ServiceLog "Port $Port is free."
+            return $true
+        }
+    }
+
+    Write-ServiceLog "Port $Port is still busy after stopping listener processes."
+    return $false
+}
+
 function Get-NodeCommand {
     if (-not [string]::IsNullOrWhiteSpace($env:NVM_SYMLINK)) {
         $nodeFromNvm = Join-Path $env:NVM_SYMLINK "node.exe"
@@ -157,10 +196,9 @@ function Start-ComfyUI {
         $baseUrl = "http://127.0.0.1:8188"
     }
     $baseUrl = $baseUrl.TrimEnd("/")
-    if (Test-HttpOk "$baseUrl/system_stats") {
-        Write-ServiceLog "ComfyUI is already running at $baseUrl"
-        return
-    }
+    $uri = [Uri]$baseUrl
+    $hostName = if ($uri.Host) { $uri.Host } else { "127.0.0.1" }
+    $port = if ($uri.Port -gt 0) { $uri.Port } else { 8188 }
 
     $root = $env:COMFYUI_ROOT
     if ([string]::IsNullOrWhiteSpace($root)) {
@@ -180,9 +218,13 @@ function Start-ComfyUI {
         Write-ServiceLog "Selected ComfyUI python may be missing dependencies: $python"
     }
 
-    $uri = [Uri]$baseUrl
-    $hostName = if ($uri.Host) { $uri.Host } else { "127.0.0.1" }
-    $port = if ($uri.Port -gt 0) { $uri.Port } else { 8188 }
+    if (Test-PortListening -Port $port) {
+        if (-not (Stop-PortListeners -Port $port)) {
+            Write-ServiceLog "ComfyUI cannot start because port $port is still occupied."
+            return
+        }
+    }
+
     $outFile = Join-Path $logDir "comfyui.out.log"
     $errFile = Join-Path $logDir "comfyui.err.log"
     Write-ServiceLog "Starting ComfyUI from $root at $baseUrl with python=$python"

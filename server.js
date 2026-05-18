@@ -518,7 +518,8 @@ function inspectComfyWorkflow(workflow) {
   const hasInputImage = types.has("LoadImage");
   const hasVideo = types.has("CreateVideo") || types.has("SaveVideo") || types.has("VHS_VideoCombine") || types.has("EmptyLTXVLatentVideo");
   const kind = hasInputImage && hasVideo ? "image-video" : hasVideo ? "video" : "image";
-  const defaults = {};
+  const defaults = inferComfyWorkflowDefaults(workflow);
+  applyFieldDerivedDefaults(defaults, graphNodes);
   for (const node of nodes) {
     const nodeType = node.type || node.class_type;
     const inputs = Array.isArray(node.inputs) ? null : node.inputs;
@@ -562,20 +563,21 @@ function inspectComfyWorkflow(workflow) {
 }
 
 function inspectComfyNodes(workflow) {
+  const subgraphDefinitions = new Map((workflow.definitions?.subgraphs || []).map(definition => [String(definition.id), definition]));
   if (Array.isArray(workflow.nodes)) {
     return workflow.nodes
-      .filter(node => node && node.mode !== 2 && node.type !== "Note")
-      .map((node, index) => inspectComfyUiNode(node, index));
+      .filter(node => !isSkippedComfyUiNode(node))
+      .map((node, index) => inspectComfyUiNode(node, index, subgraphDefinitions.get(String(node.type || node.class_type || ""))));
   }
   return Object.entries(workflow)
     .filter(([, node]) => node && typeof node === "object" && node.class_type)
     .map(([id, node], index) => inspectComfyApiNode(id, node, index));
 }
 
-function inspectComfyUiNode(node, index) {
+function inspectComfyUiNode(node, index, subgraphDefinition = null) {
   const id = String(node.id);
   const type = String(node.type || node.class_type || "Unknown");
-  const inputs = summarizeComfyUiInputs(node);
+  const inputs = summarizeComfyUiInputs(node, subgraphDefinition);
   const outputs = (node.outputs || []).map((output, slot) => ({
     name: String(output.name || output.localized_name || `output_${slot}`),
     type: String(output.type || ""),
@@ -583,6 +585,7 @@ function inspectComfyUiNode(node, index) {
     linked: Array.isArray(output.links) && output.links.length > 0
   }));
   let label = comfyNodeLabel(node, type, id);
+  if (subgraphDefinition?.name) label = String(subgraphDefinition.name);
   if (type === "CLIPTextEncode") label = inferClipTextLabel(inputs, index);
   return {
     id,
@@ -623,8 +626,9 @@ function inspectComfyApiNode(id, node, index) {
   };
 }
 
-function summarizeComfyUiInputs(node) {
+function summarizeComfyUiInputs(node, subgraphDefinition = null) {
   const values = normalizedComfyUiWidgetValues(node);
+  const subgraphDefaults = subgraphDefinition ? subgraphInputDefaults(subgraphDefinition) : new Map();
   let widgetIndex = 0;
   return (node.inputs || []).map((input, slot) => {
     const widget = input.widget?.name || null;
@@ -634,9 +638,12 @@ function summarizeComfyUiInputs(node) {
       value = safeWorkflowValue(values[widgetIndex]);
       widgetIndex += 1;
     }
+    if (value === undefined && subgraphDefaults.has(slot)) {
+      value = safeWorkflowValue(subgraphDefaults.get(slot));
+    }
     return {
       name: String(input.name || input.localized_name || `input_${slot}`),
-      label: String(input.localized_name || input.name || `input_${slot}`),
+      label: String(input.label || input.localized_name || input.name || `input_${slot}`),
       type: String(input.type || ""),
       slot,
       linked,
@@ -647,19 +654,53 @@ function summarizeComfyUiInputs(node) {
   });
 }
 
+function subgraphInputDefaults(definition) {
+  const result = new Map();
+  const links = normalizeComfyUiLinkMap(definition.links);
+  const nodesById = new Map((definition.nodes || []).map(node => [String(node.id), node]));
+  for (const [slot, input] of (definition.inputs || []).entries()) {
+    const linkIds = Array.isArray(input.linkIds) ? input.linkIds : [];
+    for (const linkId of linkIds) {
+      const link = links.get(String(linkId));
+      if (!link || !isComfySubgraphInputSource(link)) continue;
+      const target = nodesById.get(String(link.targetId));
+      const targetInput = (target?.inputs || [])[Number(link.targetSlot || 0)];
+      const defaults = comfyUiWidgetValuesByInputIndex(target);
+      const targetInputIndex = (target?.inputs || []).indexOf(targetInput);
+      if (targetInputIndex >= 0 && defaults.has(targetInputIndex)) {
+        result.set(slot, defaults.get(targetInputIndex));
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 function normalizedComfyUiWidgetValues(node) {
   const values = Array.isArray(node?.widgets_values) ? node.widgets_values.slice() : [];
   if (!isKSamplerNodeType(node?.type) || values.length < 2) return values;
   const widgetNames = (node.inputs || [])
-    .filter(input => input?.link == null && input?.widget?.name)
+    .filter(input => input?.widget?.name)
     .map(input => input.widget.name);
+  const seedIndex = widgetNames.findIndex(name => name === "seed" || name === "noise_seed");
   if (
+    seedIndex >= 0 &&
     widgetNames.includes("seed") &&
     widgetNames.includes("steps") &&
     !widgetNames.includes("control_after_generate") &&
-    isControlAfterGenerateValue(values[1])
+    values.length > widgetNames.length &&
+    isControlAfterGenerateValue(values[seedIndex + 1])
   ) {
-    values.splice(1, 1);
+    values.splice(seedIndex + 1, 1);
+  } else if (
+    seedIndex >= 0 &&
+    widgetNames.includes("noise_seed") &&
+    widgetNames.includes("steps") &&
+    !widgetNames.includes("control_after_generate") &&
+    values.length > widgetNames.length &&
+    isControlAfterGenerateValue(values[seedIndex + 1])
+  ) {
+    values.splice(seedIndex + 1, 1);
   }
   return values;
 }
@@ -806,39 +847,337 @@ function workflowKindRank(kind) {
   return { image: 0, video: 1, "image-video": 2, unknown: 3 }[kind] ?? 4;
 }
 
+function inferComfyWorkflowDefaults(workflow) {
+  const defaults = {};
+  if (!workflow?.nodes) return defaults;
+  let apiPrompt;
+  try {
+    apiPrompt = convertComfyUiWorkflow(workflow, {});
+  } catch {
+    return defaults;
+  }
+  for (const node of Object.values(apiPrompt)) {
+    const inputs = node?.inputs || {};
+    const width = resolveComfyNumber(apiPrompt, inputs.width);
+    const height = resolveComfyNumber(apiPrompt, inputs.height);
+    if (!defaults.size && Number.isFinite(width) && Number.isFinite(height)) {
+      defaults.size = `${Math.round(width)}x${Math.round(height)}`;
+    }
+    if (!defaults.fps && (node.class_type === "CreateVideo" || node.class_type === "VHS_VideoCombine")) {
+      const fps = resolveComfyNumber(apiPrompt, inputs.fps ?? inputs.frame_rate);
+      if (Number.isFinite(fps)) defaults.fps = fps;
+    }
+    if (!defaults.fps && node.class_type === "LTXVConditioning") {
+      const fps = resolveComfyNumber(apiPrompt, inputs.frame_rate ?? inputs.fps);
+      if (Number.isFinite(fps)) defaults.fps = fps;
+    }
+    if (!defaults.frames) {
+      const frames = resolveComfyNumber(apiPrompt, inputs.length ?? inputs.frames ?? inputs.num_frames ?? inputs.frame_count ?? inputs.video_length);
+      if (Number.isFinite(frames) && frames > 1) defaults.frames = Math.round(frames);
+    }
+    if (!defaults.seconds && /duration|seconds?/i.test(String(node._meta?.title || ""))) {
+      const seconds = resolveComfyNumber(apiPrompt, inputs.value);
+      if (Number.isFinite(seconds) && seconds > 0) defaults.seconds = seconds;
+    }
+    if (!defaults.steps && (node.class_type === "KSampler" || node.class_type === "KSamplerAdvanced" || node.class_type === "LTXVScheduler")) {
+      const steps = resolveComfyNumber(apiPrompt, inputs.steps);
+      if (Number.isFinite(steps) && steps > 0) defaults.steps = Math.round(steps);
+    }
+  }
+  return defaults;
+}
+
+function applyFieldDerivedDefaults(defaults, nodes) {
+  let width = null;
+  let height = null;
+  for (const node of nodes || []) {
+    for (const input of node.inputs || []) {
+      const value = Number(input.value);
+      if (!Number.isFinite(value)) continue;
+      const text = `${input.name || ""} ${input.label || ""}`.toLowerCase();
+      if (!defaults.seconds && /\b(duration|seconds?)\b/.test(text) && value > 0) defaults.seconds = value;
+      if (!defaults.fps && /\b(fps|frame[_ -]?rate)\b/.test(text) && value > 0) defaults.fps = value;
+      if (width == null && /\bwidth\b/.test(text) && value > 0) width = value;
+      if (height == null && /\bheight\b/.test(text) && value > 0) height = value;
+      if (!defaults.steps && /\bsteps?\b/.test(text) && value > 0) defaults.steps = Math.round(value);
+    }
+  }
+  if (!defaults.size && width != null && height != null) {
+    defaults.size = `${Math.round(width)}x${Math.round(height)}`;
+  }
+}
+
+function resolveComfyNumber(apiPrompt, value, seen = new Set()) {
+  const direct = Number(value);
+  if (Number.isFinite(direct)) return direct;
+  if (!Array.isArray(value) || value.length < 1) return NaN;
+  const nodeId = String(value[0]);
+  if (seen.has(nodeId)) return NaN;
+  seen.add(nodeId);
+  const node = apiPrompt?.[nodeId];
+  const inputs = node?.inputs || {};
+  if ("value" in inputs) return resolveComfyNumber(apiPrompt, inputs.value, seen);
+  if (node?.class_type === "ComfySwitchNode") {
+    const enabled = resolveComfyBoolean(apiPrompt, inputs.switch, seen);
+    return resolveComfyNumber(apiPrompt, enabled ? inputs.on_true : inputs.on_false, seen);
+  }
+  if (node?.class_type === "ComfyMathExpression") {
+    return resolveComfyMathExpression(apiPrompt, inputs, seen);
+  }
+  return NaN;
+}
+
+function resolveComfyBoolean(apiPrompt, value, seen = new Set()) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") return value.trim().toLowerCase() === "true";
+  if (Array.isArray(value) && value.length) {
+    const node = apiPrompt?.[String(value[0])];
+    if ("value" in (node?.inputs || {})) return resolveComfyBoolean(apiPrompt, node.inputs.value, seen);
+  }
+  return false;
+}
+
+function resolveComfyMathExpression(apiPrompt, inputs, seen = new Set()) {
+  const expression = String(inputs.expression || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const a = resolveComfyNumber(apiPrompt, inputs["values.a"], new Set(seen));
+  const b = resolveComfyNumber(apiPrompt, inputs["values.b"], new Set(seen));
+  const c = resolveComfyNumber(apiPrompt, inputs["values.c"], new Set(seen));
+  if (/^floor\s*\(\s*a\s*\*\s*b\s*\+\s*1\s*\)$/.test(expression) && Number.isFinite(a) && Number.isFinite(b)) {
+    return Math.floor(a * b + 1);
+  }
+  if (/^floor\s*\(\s*a\s*\*\s*b\s*\)$/.test(expression) && Number.isFinite(a) && Number.isFinite(b)) {
+    return Math.floor(a * b);
+  }
+  if (/^a\s*\*\s*b$/.test(expression) && Number.isFinite(a) && Number.isFinite(b)) {
+    return a * b;
+  }
+  if (/^a\s*\*\s*b\s*\+\s*c$/.test(expression) && Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(c)) {
+    return a * b + c;
+  }
+  return NaN;
+}
+
 function buildComfyPrompt(workflow, options) {
-  const apiPrompt = workflow.nodes ? convertComfyUiWorkflow(workflow) : structuredClone(workflow);
+  const apiPrompt = workflow.nodes ? convertComfyUiWorkflow(workflow, options) : structuredClone(workflow);
   patchComfyPrompt(apiPrompt, options);
   return apiPrompt;
 }
 
-function convertComfyUiWorkflow(workflow) {
-  const links = new Map((workflow.links || []).map(link => [link[0], link]));
+function convertComfyUiWorkflow(workflow, options = {}) {
   const graph = {};
-  for (const node of workflow.nodes || []) {
-    if (!node || node.mode === 2) continue;
-    if (node.type === "Note") continue;
-    const inputs = {};
-    const widgetValues = normalizedComfyUiWidgetValues(node);
-    let widgetIndex = 0;
-    for (const input of node.inputs || []) {
-      if (input.link != null) {
-        const link = links.get(input.link);
-        if (link) inputs[input.name] = [String(link[1]), link[2]];
-      } else if (input.widget?.name) {
-        inputs[input.widget.name] = widgetValues[widgetIndex];
-        widgetIndex += 1;
-      }
-    }
-    graph[String(node.id)] = {
-      class_type: node.type,
-      inputs
-    };
-    if (node._meta?.title || node.title) {
-      graph[String(node.id)]._meta = { title: node._meta?.title || node.title };
+  const subgraphDefinitions = new Map((workflow.definitions?.subgraphs || []).map(definition => [String(definition.id), definition]));
+  appendComfyUiGraph(graph, workflow, {
+    idPrefix: "",
+    subgraphDefinitions,
+    expandedOutputs: new Map(),
+    externalInputsByLinkId: new Map(),
+    workflowParams: isPlainObject(options.workflowParams) ? options.workflowParams : {},
+    stack: []
+  });
+  return graph;
+}
+
+function appendComfyUiGraph(graph, workflow, context) {
+  const links = normalizeComfyUiLinkMap(workflow.links);
+  const nodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
+  const subgraphInstances = [];
+  const expandedOutputs = new Map(context.expandedOutputs || []);
+
+  for (const node of nodes) {
+    if (isSkippedComfyUiNode(node)) continue;
+    const definition = context.subgraphDefinitions.get(String(node.type || node.class_type || ""));
+    if (!definition || context.stack.includes(String(definition.id))) continue;
+    const idPrefix = `${context.idPrefix}${node.id}_`;
+    subgraphInstances.push({ node, definition, idPrefix });
+    for (const [slot, ref] of collectComfySubgraphOutputRefs(definition, idPrefix)) {
+      expandedOutputs.set(`${node.id}:${slot}`, ref);
     }
   }
-  return graph;
+
+  for (const instance of subgraphInstances) {
+    const externalInputsByLinkId = buildComfySubgraphExternalInputs(instance.node, instance.definition, links, {
+      ...context,
+      expandedOutputs
+    });
+    appendComfyUiGraph(graph, instance.definition, {
+      ...context,
+      idPrefix: instance.idPrefix,
+      expandedOutputs,
+      externalInputsByLinkId,
+      stack: [...context.stack, String(instance.definition.id)]
+    });
+  }
+
+  for (const node of nodes) {
+    if (isSkippedComfyUiNode(node)) continue;
+    if (context.subgraphDefinitions.has(String(node.type || node.class_type || ""))) continue;
+    appendComfyUiNode(graph, node, links, {
+      ...context,
+      expandedOutputs
+    });
+  }
+}
+
+function appendComfyUiNode(graph, node, links, context) {
+  const nodeId = `${context.idPrefix}${node.id}`;
+  const type = String(node.type || node.class_type || "");
+  const inputs = {};
+  const widgetValuesByInput = comfyUiWidgetValuesByInputIndex(node);
+  for (const [inputIndex, input] of (node.inputs || []).entries()) {
+    const inputName = String(input.name || input.localized_name || "");
+    const widgetName = input.widget?.name;
+    if (input.link != null) {
+      const resolved = resolveComfyUiInputLink(input.link, links, context);
+      if (resolved.type === "link") {
+        inputs[inputName] = resolved.value;
+        continue;
+      }
+      if (resolved.type === "value") {
+        inputs[inputName || widgetName] = resolved.value;
+        continue;
+      }
+    }
+    if (widgetName && widgetValuesByInput.has(inputIndex)) {
+      inputs[widgetName] = widgetValuesByInput.get(inputIndex);
+    }
+  }
+  graph[nodeId] = { class_type: type, inputs };
+  if (node._meta?.title || node.title) {
+    graph[nodeId]._meta = { title: node._meta?.title || node.title };
+  }
+}
+
+function normalizeComfyUiLinkMap(rawLinks) {
+  const links = new Map();
+  for (const link of rawLinks || []) {
+    const normalized = normalizeComfyUiLink(link);
+    if (normalized) links.set(String(normalized.id), normalized);
+  }
+  return links;
+}
+
+function normalizeComfyUiLink(link) {
+  if (Array.isArray(link)) {
+    return {
+      id: link[0],
+      originId: link[1],
+      originSlot: Number(link[2] || 0),
+      targetId: link[3],
+      targetSlot: Number(link[4] || 0),
+      type: link[5]
+    };
+  }
+  if (!link || typeof link !== "object") return null;
+  return {
+    id: link.id,
+    originId: link.origin_id ?? link.originId ?? link.source_id ?? link.sourceId ?? link.from,
+    originSlot: Number(link.origin_slot ?? link.originSlot ?? link.source_slot ?? link.sourceSlot ?? link.fromSlot ?? 0),
+    targetId: link.target_id ?? link.targetId ?? link.destination_id ?? link.destinationId ?? link.to,
+    targetSlot: Number(link.target_slot ?? link.targetSlot ?? link.destination_slot ?? link.destinationSlot ?? link.toSlot ?? 0),
+    type: link.type
+  };
+}
+
+function collectComfySubgraphOutputRefs(definition, idPrefix) {
+  const outputRefs = new Map();
+  const links = normalizeComfyUiLinkMap(definition.links);
+  for (const [slot, output] of (definition.outputs || []).entries()) {
+    const linkIds = Array.isArray(output.linkIds) ? output.linkIds : [];
+    for (const linkId of linkIds) {
+      const link = links.get(String(linkId));
+      if (!link || !isComfySubgraphOutputTarget(link)) continue;
+      outputRefs.set(slot, [`${idPrefix}${link.originId}`, link.originSlot]);
+      break;
+    }
+  }
+  return outputRefs;
+}
+
+function buildComfySubgraphExternalInputs(node, definition, parentLinks, context) {
+  const recordsByDefinitionInput = new Map();
+  const wrapperInputs = node.inputs || [];
+  const widgetValuesByInput = comfyUiWidgetValuesByInputIndex(node);
+  for (const [index, definitionInput] of (definition.inputs || []).entries()) {
+    const wrapperInput = wrapperInputs[index] || wrapperInputs.find(input => input?.name === definitionInput.name);
+    const explicitValue = explicitWorkflowParamForComfyInput(node.id, wrapperInput, context.workflowParams);
+    if (explicitValue.found) {
+      recordsByDefinitionInput.set(index, { type: "value", value: explicitValue.value });
+    } else if (wrapperInput?.link != null) {
+      const resolved = resolveComfyUiInputLink(wrapperInput.link, parentLinks, context);
+      if (resolved.type === "link" || resolved.type === "value") recordsByDefinitionInput.set(index, resolved);
+    } else {
+      const wrapperIndex = wrapperInputs.indexOf(wrapperInput);
+      if (wrapperIndex >= 0 && widgetValuesByInput.has(wrapperIndex)) {
+        recordsByDefinitionInput.set(index, { type: "value", value: widgetValuesByInput.get(wrapperIndex) });
+      }
+    }
+  }
+
+  const recordsByLinkId = new Map();
+  for (const [index, definitionInput] of (definition.inputs || []).entries()) {
+    const record = recordsByDefinitionInput.get(index) || { type: "missing" };
+    for (const linkId of definitionInput.linkIds || []) {
+      recordsByLinkId.set(String(linkId), record);
+    }
+  }
+  return recordsByLinkId;
+}
+
+function explicitWorkflowParamForComfyInput(nodeId, input, workflowParams = {}) {
+  if (!input || !isPlainObject(workflowParams)) return { found: false };
+  const names = [input.name, input.widget?.name].filter(Boolean);
+  for (const name of names) {
+    const key = `${nodeId}.${name}`;
+    if (!Object.prototype.hasOwnProperty.call(workflowParams, key)) continue;
+    const value = workflowParams[key];
+    if (value == null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    return { found: true, value };
+  }
+  return { found: false };
+}
+
+function resolveComfyUiInputLink(linkId, links, context) {
+  const link = links.get(String(linkId));
+  if (!link) return { type: "missing" };
+  if (isComfySubgraphInputSource(link)) {
+    return context.externalInputsByLinkId.get(String(link.id)) || { type: "missing" };
+  }
+  const expandedOutput = context.expandedOutputs.get(`${link.originId}:${link.originSlot}`);
+  return {
+    type: "link",
+    value: expandedOutput || [`${context.idPrefix}${link.originId}`, link.originSlot]
+  };
+}
+
+function comfyUiWidgetValuesByInputIndex(node) {
+  const values = normalizedComfyUiWidgetValues(node);
+  const result = new Map();
+  let widgetIndex = 0;
+  for (const [inputIndex, input] of (node.inputs || []).entries()) {
+    if (!input.widget?.name) continue;
+    if (widgetIndex < values.length) result.set(inputIndex, values[widgetIndex]);
+    widgetIndex += 1;
+  }
+  return result;
+}
+
+function isSkippedComfyUiNode(node) {
+  if (!node || node.mode === 2) return true;
+  const type = String(node.type || node.class_type || "");
+  return type === "Note" || type === "MarkdownNote";
+}
+
+function isComfySubgraphInputSource(link) {
+  return String(link.originId) === "-10";
+}
+
+function isComfySubgraphOutputTarget(link) {
+  return String(link.targetId) === "-20";
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function patchComfyPrompt(apiPrompt, options) {
@@ -848,12 +1187,12 @@ function patchComfyPrompt(apiPrompt, options) {
     .filter(([, node]) => node.class_type === "CLIPTextEncode" && "text" in node.inputs)
     .map(([nodeId]) => nodeId);
   for (const [nodeId, node] of Object.entries(apiPrompt)) {
-    const title = String(node._meta?.title || "").toLowerCase();
+    const textRole = comfyClipTextRole(nodeId, node, textNodeIds);
     if (node.class_type === "CLIPTextEncode" && "text" in node.inputs) {
-      if (nodeId === "6" || title.includes("positive") || nodeId === textNodeIds[0]) {
+      if (textRole === "positive") {
         node.inputs.text = options.prompt;
       }
-      if (nodeId === "7" || title.includes("negative") || nodeId === textNodeIds[1]) {
+      if (textRole === "negative") {
         node.inputs.text = options.negativePrompt || "";
       }
     }
@@ -894,6 +1233,16 @@ function patchComfyPrompt(apiPrompt, options) {
       if ("filename_prefix" in node.inputs) node.inputs.filename_prefix = options.filenamePrefix;
     }
   }
+}
+
+function comfyClipTextRole(nodeId, node, textNodeIds) {
+  const title = String(node?._meta?.title || node?.title || "").toLowerCase();
+  if (nodeId === "6" || title.includes("positive") || title.includes("正向") || title.includes("正面")) return "positive";
+  if (nodeId === "7" || title.includes("negative") || title.includes("负向") || title.includes("负面") || title.includes("反向")) return "negative";
+  const index = textNodeIds.indexOf(nodeId);
+  if (index === 0) return "positive";
+  if (index === 1) return "negative";
+  return "";
 }
 
 async function waitForComfyHistory(promptId, job) {
