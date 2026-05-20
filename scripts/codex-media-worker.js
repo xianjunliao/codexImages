@@ -16,16 +16,18 @@ const pollMs = Number(process.env.CODEX_MEDIA_POLL_MS || 10000);
 const deletePollMs = Number(process.env.CODEX_MEDIA_DELETE_POLL_MS || 5000);
 const workflowSyncMs = Math.max(5000, Number(process.env.CODEX_MEDIA_WORKFLOW_SYNC_MS || 60000));
 const workflowSyncEnabled = String(process.env.CODEX_MEDIA_WORKFLOW_SYNC_ENABLED || "true").toLowerCase() !== "false";
+const workflowSyncRepeatEnabled = String(process.env.CODEX_MEDIA_WORKFLOW_SYNC_REPEAT_ENABLED || "false").toLowerCase() === "true";
 const codexImagesBaseUrl = (process.env.CODEX_IMAGES_BASE_URL || process.env.CODEX_MEDIA_LOCAL_BASE_URL || "http://127.0.0.1:3027").replace(/\/$/, "");
 const once = process.argv.includes("--once");
 const noDeleteSweeper = process.argv.includes("--no-delete-sweeper");
 const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
 const ffmpegCommand = process.env.FFMPEG_COMMAND || resolveFfmpegCommand();
 const codexTimeoutMs = Number(process.env.CODEX_MEDIA_CODEX_TIMEOUT_MS || 20 * 60 * 1000);
-const outputRoot = process.env.CODEX_MEDIA_OUTPUT_DIR ||
-  path.join(projectRoot, "generated", "codex-media");
+const imageOutputRoot = process.env.CODEX_MEDIA_IMAGE_DIR || "E:\\lifeFiles\\images";
+const videoOutputRoot = process.env.CODEX_MEDIA_VIDEO_DIR || "E:\\lifeFiles\\video";
+const outputRoot = process.env.CODEX_MEDIA_OUTPUT_DIR || imageOutputRoot;
 const publicOutputPrefix = process.env.CODEX_MEDIA_PUBLIC_PREFIX || "";
-const uploadToLife = String(process.env.CODEX_MEDIA_UPLOAD_TO_LIFE || "true").toLowerCase() !== "false";
+const uploadToLife = false;
 const uploadThemeName = process.env.CODEX_MEDIA_UPLOAD_THEME || "CodexMedia";
 const lifeAccessKey = (process.env.CODEX_MEDIA_ACCESS_KEY || "").trim();
 let lifeAccessToken = (process.env.CODEX_MEDIA_SESSION_TOKEN || process.env.LIFE_ACCESS_TOKEN || "").trim();
@@ -108,7 +110,8 @@ const COMFY_SAMPLERS = new Set([
 ]);
 const SKIP_WORKFLOW_PARAM = Symbol("skip workflow param");
 
-await fs.mkdir(outputRoot, { recursive: true });
+await fs.mkdir(imageOutputRoot, { recursive: true });
+await fs.mkdir(videoOutputRoot, { recursive: true });
 const releaseWorkerLock = once ? null : await acquireWorkerLock();
 let workflowSyncBusy = false;
 await ensureLifeAuth();
@@ -121,7 +124,7 @@ if (workflowSyncEnabled) {
 log(`Codex media worker started. life=${lifeBaseUrl} codex=${codexCommand}`);
 
 let deleteSweepBusy = false;
-if (!once && workflowSyncEnabled) {
+if (!once && workflowSyncEnabled && workflowSyncRepeatEnabled) {
   setInterval(() => {
     syncComfyWorkflows().catch((error) => {
       log(`Workflow sync error: ${errorMessage(error)}`);
@@ -343,10 +346,10 @@ async function processJobInner(job) {
   if (looksLikeMojibake(job.prompt)) {
     throw new Error("任务提示词疑似编码损坏，已拒绝生成。请修复 life 请求/数据库编码后重新提交原始中文提示词。");
   }
-  const jobOutputDir = path.join(outputRoot, safeSegment(requestId));
-  await fs.mkdir(jobOutputDir, { recursive: true });
-  log(`Processing ${requestId}`);
   const options = parseJson(job.options_json);
+  const jobOutputDir = path.join(resolveJobOutputRoot(job, options), safeSegment(requestId));
+  await fs.mkdir(jobOutputDir, { recursive: true });
+  log(`Processing ${requestId} -> ${jobOutputDir}`);
 
   if (isComfyProvider(options)) {
     await processComfyJob(job, jobOutputDir, options);
@@ -428,6 +431,20 @@ async function processJobInner(job) {
   log(`Completed ${requestId} with ${assets.length} asset(s).`);
 }
 
+function resolveJobOutputRoot(job, options = {}) {
+  const mode = String(job.mode || options.mode || "").toLowerCase();
+  const workflowMode = String(options.workflowMode || options.mediaMode || "").toLowerCase();
+  const provider = String(options.provider || options.mediaProvider || "").toLowerCase();
+  if (isVideoMode(mode) || mode === "image-video" || workflowMode.includes("video")) {
+    return videoOutputRoot;
+  }
+  if (provider === "comfyui") {
+    const workflowName = String(options.workflowName || options.workflow || options.comfyWorkflow || "").toLowerCase();
+    if (workflowName.includes("视频") || workflowName.includes("video")) return videoOutputRoot;
+  }
+  return imageOutputRoot || outputRoot;
+}
+
 async function runCodexForJob(job, jobOutputDir, promptFile, lastMessageFile) {
   const settings = parseVideoSettings(job, parseJson(job.options_json));
   if (!settings.wantsVideo || settings.frameCount <= settings.segmentFrames) {
@@ -504,6 +521,7 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
   const mode = String(job.mode || "images").toLowerCase();
   const isImageVideo = mode === "image-video";
   const isVideo = isVideoMode(mode);
+  const requestedOutputCount = isVideo ? 1 : clampInteger(job.image_count, 1, 48, 1);
   if (isImageVideo && !hasUsableInitImage(options.initImage)) {
     throw new Error("图生视频需要上传一张图片，且附件必须是图片文件。");
   }
@@ -521,38 +539,71 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
   ).trim();
   const initImageName = isImageVideo ? await writeComfyInputImage(job, options.initImage) : "";
   const workflow = await loadComfyWorkflow(workflowName);
-  const promptGraph = buildComfyPrompt(workflow, {
-    ...options,
-    prompt: job.prompt || "",
-    filenamePrefix: `${comfyOutputSegment(job)}/output`,
-    preserveWorkflowParams: true,
-    isVideo,
-    durationSeconds: resolveExplicitComfyDurationSeconds(job, options),
-    initImageName
-  });
-  await fs.writeFile(path.join(jobOutputDir, "comfyui-prompt.json"), JSON.stringify(promptGraph, null, 2), "utf8");
-  const progressMonitor = createComfyProgressMonitor(job);
+  const independentImageRuns = !isVideo && requestedOutputCount > 1;
+  const runCount = independentImageRuns ? requestedOutputCount : 1;
+  const imagePrompts = normalizeImagePrompts(options.imagePrompts || options.workflowParams?.imagePrompts);
+  const savedAssets = [];
+  const promptIds = [];
   const comfySubmittedAt = Date.now();
-  const queued = await comfyFetch("/prompt", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: promptGraph, client_id: progressMonitor.clientId })
-  });
-  const promptId = queued.prompt_id;
-  if (!promptId) throw new Error("ComfyUI did not return a prompt_id.");
-  progressMonitor.setPromptId(promptId);
-  log(`ComfyUI queued ${job.request_id}: ${promptId}`);
-  let historyItem;
-  try {
-    historyItem = await waitForComfyHistory(promptId, job, progressMonitor);
-  } finally {
-    progressMonitor.finish();
+  let comfyCompletedAt = comfySubmittedAt;
+  let firstExecutionStartedAt = 0;
+  for (let runIndex = 0; runIndex < runCount; runIndex += 1) {
+    const runOutputCount = independentImageRuns ? 1 : requestedOutputCount;
+    const runPrompt = independentImageRuns
+      ? imagePromptForRun(imagePrompts[runIndex], job.prompt || "", options.negativePrompt || "", runIndex, requestedOutputCount)
+      : { prompt: job.prompt || "", negativePrompt: options.negativePrompt || "" };
+    const promptGraph = buildComfyPrompt(workflow, {
+      ...options,
+      prompt: runPrompt.prompt,
+      negativePrompt: runPrompt.negativePrompt,
+      filenamePrefix: `${comfyOutputSegment(job)}/output${independentImageRuns ? `-${String(runIndex + 1).padStart(4, "0")}` : ""}`,
+      imageCount: runOutputCount,
+      batchSize: runOutputCount,
+      randomizeSeed: independentImageRuns,
+      preserveWorkflowParams: true,
+      isVideo,
+      durationSeconds: resolveExplicitComfyDurationSeconds(job, options),
+      initImageName
+    });
+    await fs.writeFile(
+      path.join(jobOutputDir, independentImageRuns ? `comfyui-prompt-${String(runIndex + 1).padStart(4, "0")}.json` : "comfyui-prompt.json"),
+      JSON.stringify(promptGraph, null, 2),
+      "utf8"
+    );
+    if (independentImageRuns) {
+      await postJobProgress(job.request_id, {
+        phase: "comfyui_generating",
+        progressLabel: "ComfyUI 生成中",
+        progressText: `ComfyUI 正在生成第 ${runIndex + 1}/${requestedOutputCount} 张独立图片。`,
+        progressPercent: Math.max(16, Math.round((runIndex / requestedOutputCount) * 80))
+      });
+    }
+    const progressMonitor = createComfyProgressMonitor(job);
+    const queued = await comfyFetch("/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: promptGraph, client_id: progressMonitor.clientId })
+    });
+    const promptId = queued.prompt_id;
+    if (!promptId) throw new Error("ComfyUI did not return a prompt_id.");
+    promptIds.push(promptId);
+    progressMonitor.setPromptId(promptId);
+    log(`ComfyUI queued ${job.request_id}: ${promptId}${independentImageRuns ? ` (${runIndex + 1}/${requestedOutputCount})` : ""}`);
+    let historyItem;
+    try {
+      historyItem = await waitForComfyHistory(promptId, job, progressMonitor);
+    } finally {
+      if (!firstExecutionStartedAt && progressMonitor.executionStartedAt) firstExecutionStartedAt = progressMonitor.executionStartedAt;
+      progressMonitor.finish();
+    }
+    comfyCompletedAt = Date.now();
+    const outputs = isVideo ? collectComfyVideos(historyItem) : collectComfyImages(historyItem);
+    const nextAssets = outputs.length
+      ? await saveComfyHistoryOutputs(job, jobOutputDir, outputs.slice(0, runOutputCount), isVideo, savedAssets.length)
+      : await collectComfyOutputAssets(job, jobOutputDir, isVideo, runOutputCount, savedAssets.length);
+    if (!nextAssets.length) throw new Error(`ComfyUI finished without ${isVideo ? "video" : "image"} outputs.`);
+    savedAssets.push(...nextAssets.slice(0, runOutputCount));
   }
-  const comfyCompletedAt = Date.now();
-  const outputs = isVideo ? collectComfyVideos(historyItem) : collectComfyImages(historyItem);
-  const savedAssets = outputs.length
-    ? await saveComfyHistoryOutputs(job, jobOutputDir, outputs.slice(0, 1), isVideo)
-    : await collectComfyOutputAssets(job, jobOutputDir, isVideo);
   if (!savedAssets.length) throw new Error(`ComfyUI finished without ${isVideo ? "video" : "image"} outputs.`);
 
   const assets = uploadToLife ? await uploadAssetsToLife(savedAssets) : savedAssets;
@@ -563,22 +614,61 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
     outputDir: jobOutputDir,
     provider: "comfyui",
     workflow: workflowName,
-    comfyPromptId: promptId,
+    comfyPromptId: promptIds[0] || "",
+    comfyPromptIds: promptIds,
     comfyElapsedMs: comfyCompletedAt - comfySubmittedAt,
-    comfyExecutionElapsedMs: progressMonitor.executionStartedAt
-      ? comfyCompletedAt - progressMonitor.executionStartedAt
+    comfyExecutionElapsedMs: firstExecutionStartedAt
+      ? comfyCompletedAt - firstExecutionStartedAt
       : 0
   });
   log(`Completed ${job.request_id} with ComfyUI (${assets.length} asset).`);
 }
 
-async function saveComfyHistoryOutputs(job, jobOutputDir, outputs, isVideo) {
+function normalizeImagePrompts(value) {
+  return Array.isArray(value) ? value.filter(item => item && typeof item === "object") : [];
+}
+
+function imagePromptForRun(promptInfo, basePrompt, baseNegativePrompt, index, total) {
+  const positivePrompt = String(
+    promptInfo?.positivePromptEn
+    || promptInfo?.positive_en
+    || promptInfo?.positivePrompt
+    || promptInfo?.prompt
+    || basePrompt
+    || ""
+  ).trim();
+  const negativePrompt = String(
+    promptInfo?.negativePromptEn
+    || promptInfo?.negative_en
+    || promptInfo?.negativePrompt
+    || promptInfo?.negative
+    || baseNegativePrompt
+    || ""
+  ).trim();
+  return {
+    prompt: singleStandaloneComfyPrompt(positivePrompt, index, total),
+    negativePrompt
+  };
+}
+
+function singleStandaloneComfyPrompt(prompt, index, total) {
+  return [
+    `Single standalone image ${index + 1} of ${total}. Generate exactly one complete image file for this run.`,
+    "Use one complete composition, one scene, and one final variation for this run.",
+    "If the original request asks for different scenes or styles, treat this run as one distinct standalone variation with its own scene/style.",
+    "",
+    prompt || ""
+  ].join("\n").trim();
+}
+
+async function saveComfyHistoryOutputs(job, jobOutputDir, outputs, isVideo, startIndex = 0) {
   const savedAssets = [];
-  for (const output of outputs) {
+  for (const [index, output] of outputs.entries()) {
     const buffer = await downloadComfyFile(output);
     const fallbackExt = isVideo ? ".mp4" : ".png";
     const ext = path.extname(output.filename || output.name || "").toLowerCase() || fallbackExt;
-    const fileName = isVideo ? `clip-0001${ext}` : `frame-0001${ext}`;
+    const assetIndex = startIndex + index + 1;
+    const fileName = isVideo ? `clip-${String(assetIndex).padStart(4, "0")}${ext}` : `frame-${String(assetIndex).padStart(4, "0")}${ext}`;
     const filePath = path.join(jobOutputDir, fileName);
     await fs.writeFile(filePath, buffer);
     const stat = await fs.stat(filePath);
@@ -594,7 +684,7 @@ async function saveComfyHistoryOutputs(job, jobOutputDir, outputs, isVideo) {
   return savedAssets;
 }
 
-async function collectComfyOutputAssets(job, jobOutputDir, isVideo) {
+async function collectComfyOutputAssets(job, jobOutputDir, isVideo, limit = 1, startIndex = 0) {
   const requestId = safeSegment(job.request_id || "");
   const outputSegment = comfyOutputSegment(job);
   const outputDir = path.join(comfyRoot, "output");
@@ -615,21 +705,26 @@ async function collectComfyOutputAssets(job, jobOutputDir, isVideo) {
     : /\.(png|jpe?g|webp|gif)$/i;
   const candidates = files.filter(file => pattern.test(file)).sort();
   if (!candidates.length) return [];
-  const source = candidates[candidates.length - 1];
-  const ext = path.extname(source).toLowerCase() || (isVideo ? ".mp4" : ".png");
-  const fileName = isVideo ? `clip-0001${ext}` : `frame-0001${ext}`;
-  const targetPath = path.join(jobOutputDir, fileName);
-  await fs.copyFile(source, targetPath);
-  const stat = await fs.stat(targetPath);
-  log(`Recovered ComfyUI ${isVideo ? "video" : "image"} output from ${source}`);
-  return [{
-    fileName,
-    path: targetPath,
-    size: stat.size,
-    url: buildLocalAssetUrl(jobOutputDir, fileName),
-    localUrl: buildLocalAssetUrl(jobOutputDir, fileName),
-    comfyRecoveredFrom: source
-  }];
+  const selected = candidates.slice(-Math.max(1, limit));
+  const assets = [];
+  for (const [index, source] of selected.entries()) {
+    const ext = path.extname(source).toLowerCase() || (isVideo ? ".mp4" : ".png");
+    const assetIndex = startIndex + index + 1;
+    const fileName = isVideo ? `clip-${String(assetIndex).padStart(4, "0")}${ext}` : `frame-${String(assetIndex).padStart(4, "0")}${ext}`;
+    const targetPath = path.join(jobOutputDir, fileName);
+    await fs.copyFile(source, targetPath);
+    const stat = await fs.stat(targetPath);
+    assets.push({
+      fileName,
+      path: targetPath,
+      size: stat.size,
+      url: buildLocalAssetUrl(jobOutputDir, fileName),
+      localUrl: buildLocalAssetUrl(jobOutputDir, fileName),
+      comfyRecoveredFrom: source
+    });
+  }
+  log(`Recovered ${assets.length} ComfyUI ${isVideo ? "video" : "image"} output(s).`);
+  return assets;
 }
 
 function buildCodexPrompt(job, outputDir, frameSegment = null, videoSettings = null) {
@@ -778,7 +873,8 @@ async function runCodex(promptFile, lastMessageFile, job) {
       "--skip-git-repo-check",
       "-C", projectRoot,
       "-s", "workspace-write",
-      "--add-dir", outputRoot,
+      "--add-dir", imageOutputRoot,
+      "--add-dir", videoOutputRoot,
       "--output-last-message", lastMessageFile,
       "-"
     ];
@@ -1240,6 +1336,8 @@ function patchComfyPrompt(apiPrompt, options) {
   const preserveWorkflowParams = Boolean(options.preserveWorkflowParams);
   const workflowParams = isPlainObject(options.workflowParams) ? options.workflowParams : {};
   const durationFrames = isVideo ? computeComfyDurationFrames(apiPrompt, options) : 0;
+  const imageBatchSize = !isVideo ? clampInteger(options.imageCount || options.batchSize, 1, 48, 1) : 1;
+  const randomizeSeed = Boolean(options.randomizeSeed);
   const textNodeIds = Object.entries(apiPrompt)
     .filter(([, node]) => node.class_type === "CLIPTextEncode" && "text" in node.inputs)
     .map(([nodeId]) => nodeId);
@@ -1255,6 +1353,9 @@ function patchComfyPrompt(apiPrompt, options) {
       if ("batch_size" in node.inputs) node.inputs.batch_size = options.batchSize || 1;
       if (node.class_type === "EmptyLTXVLatentVideo" && "length" in node.inputs) node.inputs.length = options.frames || 73;
     }
+    if (preserveWorkflowParams && imageBatchSize > 1 && ["EmptyLatentImage", "EmptySD3LatentImage"].includes(node.class_type) && "batch_size" in node.inputs) {
+      node.inputs.batch_size = imageBatchSize;
+    }
     if (!preserveWorkflowParams && node.class_type === "CreateVideo" && "fps" in node.inputs) node.inputs.fps = options.fps || 24;
     if (!preserveWorkflowParams && node.class_type === "LTXVConditioning" && "frame_rate" in node.inputs) node.inputs.frame_rate = options.fps || 24;
     if (!preserveWorkflowParams && isVideo && (node.class_type === "INTConstant" || node.class_type === "PrimitiveInt") && "value" in node.inputs) node.inputs.value = options.frames || node.inputs.value;
@@ -1267,6 +1368,10 @@ function patchComfyPrompt(apiPrompt, options) {
     applyExplicitWorkflowParams(nodeId, node, workflowParams);
     if (node.class_type === "LoadImage" && options.initImageName && "image" in node.inputs) {
       node.inputs.image = options.initImageName;
+    }
+    if (randomizeSeed && !isVideo && isPlainObject(node.inputs)) {
+      if ("seed" in node.inputs) node.inputs.seed = randomSeed();
+      if ("noise_seed" in node.inputs) node.inputs.noise_seed = randomSeed();
     }
     if (node.class_type === "CLIPTextEncode" && "text" in node.inputs && (options.prompt != null || options.negativePrompt != null)) {
       if (textRole === "positive") node.inputs.text = options.prompt || "";
@@ -1756,7 +1861,8 @@ function resolveDeleteTargets(job) {
     targets.add(path.resolve(outputDir));
   }
   if (requestId) {
-    targets.add(path.resolve(outputRoot, requestId));
+    targets.add(path.resolve(imageOutputRoot, requestId));
+    targets.add(path.resolve(videoOutputRoot, requestId));
   }
   if (Array.isArray(result.assets)) {
     for (const asset of result.assets) {
@@ -1777,9 +1883,9 @@ async function removeLocalOutputDir(target) {
 }
 
 function isWithinOutputRoot(target) {
-  const root = path.resolve(outputRoot);
+  const roots = [imageOutputRoot, videoOutputRoot, outputRoot].filter(Boolean).map(root => path.resolve(root));
   const resolved = path.resolve(target || "");
-  return resolved === root || resolved.startsWith(root + path.sep);
+  return roots.some(root => resolved === root || resolved.startsWith(root + path.sep));
 }
 
 async function getJson(url) {

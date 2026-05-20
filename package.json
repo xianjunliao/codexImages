@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1",
+    "start:local": "powershell -ExecutionPolicy Bypass -File scripts/start-local-life-services.ps1",
+    "start:local:once": "powershell -ExecutionPolicy Bypass -File scripts/start-local-life-services.ps1 -NoFollowLogs",
     "server": "node server.js",
     "start:web": "node server.js",
     "dev": "node server.js",
