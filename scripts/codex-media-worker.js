@@ -48,6 +48,10 @@ const lmStudioApiToken = (process.env.LMSTUDIO_API_TOKEN || process.env.LM_API_T
 const lmStudioUnloadTimeoutMs = numberEnv("LMSTUDIO_UNLOAD_TIMEOUT_MS", 15000);
 const unloadLmStudioBeforeComfy = String(process.env.CODEX_MEDIA_UNLOAD_LMSTUDIO_BEFORE_COMFYUI || "true").toLowerCase() !== "false";
 const requireLmStudioUnloadBeforeComfy = String(process.env.CODEX_MEDIA_REQUIRE_LMSTUDIO_UNLOAD || "false").toLowerCase() === "true";
+const comfyImageTimeoutMs = numberEnv("COMFYUI_IMAGE_TIMEOUT_MS", numberEnv("COMFYUI_TIMEOUT_MS", 30 * 60 * 1000));
+const comfyVideoTimeoutMs = numberEnv("COMFYUI_VIDEO_TIMEOUT_MS", numberEnv("COMFYUI_TIMEOUT_MS", 2 * 60 * 60 * 1000));
+const restartComfyOnTimeout = String(process.env.COMFYUI_RESTART_ON_TIMEOUT || "true").toLowerCase() !== "false";
+const comfyRestartTimeoutMs = numberEnv("COMFYUI_RESTART_TIMEOUT_MS", 2 * 60 * 1000);
 const defaultComfyVideoWorkflow = process.env.COMFYUI_DEFAULT_VIDEO_WORKFLOW || "文生视频";
 const defaultComfyImageToVideoWorkflow = process.env.COMFYUI_DEFAULT_IMAGE_TO_VIDEO_WORKFLOW || "图生视频";
 const COMFY_CONTROL_AFTER_GENERATE_VALUES = new Set(["fixed", "increment", "decrement", "randomize"]);
@@ -124,6 +128,7 @@ if (workflowSyncEnabled) {
 log(`Codex media worker started. life=${lifeBaseUrl} codex=${codexCommand}`);
 
 let deleteSweepBusy = false;
+let comfyRestartInProgress = false;
 if (!once && workflowSyncEnabled && workflowSyncRepeatEnabled) {
   setInterval(() => {
     syncComfyWorkflows().catch((error) => {
@@ -591,7 +596,7 @@ async function processComfyJob(job, jobOutputDir, options = {}) {
     log(`ComfyUI queued ${job.request_id}: ${promptId}${independentImageRuns ? ` (${runIndex + 1}/${requestedOutputCount})` : ""}`);
     let historyItem;
     try {
-      historyItem = await waitForComfyHistory(promptId, job, progressMonitor);
+      historyItem = await waitForComfyHistory(promptId, job, progressMonitor, { isVideo });
     } finally {
       if (!firstExecutionStartedAt && progressMonitor.executionStartedAt) firstExecutionStartedAt = progressMonitor.executionStartedAt;
       progressMonitor.finish();
@@ -1516,9 +1521,10 @@ function isTruthy(value) {
   return text === "true" || text === "1" || text === "yes";
 }
 
-async function waitForComfyHistory(promptId, job, progressMonitor = null) {
+async function waitForComfyHistory(promptId, job, progressMonitor = null, options = {}) {
   const startedAt = Date.now();
-  const timeoutMs = Number(process.env.COMFYUI_TIMEOUT_MS || 30 * 60 * 1000);
+  const isVideo = Boolean(options.isVideo);
+  const timeoutMs = resolveComfyTimeoutMs(isVideo);
   while (Date.now() - startedAt < timeoutMs) {
     await sleep(2000);
     const history = await comfyFetch(`/history/${encodeURIComponent(promptId)}`);
@@ -1535,7 +1541,134 @@ async function waitForComfyHistory(promptId, job, progressMonitor = null) {
       comfyElapsedMs: Date.now() - startedAt
     });
   }
-  throw new Error(`ComfyUI timed out waiting for ${promptId}.`);
+  await restartComfyAfterTimeout(promptId, job, { isVideo, timeoutMs });
+  throw new Error(`ComfyUI ${isVideo ? "video" : "image"} timed out waiting for ${promptId} after ${formatEta(Math.round(timeoutMs / 1000))}.`);
+}
+
+function resolveComfyTimeoutMs(isVideo) {
+  return isVideo ? comfyVideoTimeoutMs : comfyImageTimeoutMs;
+}
+
+async function restartComfyAfterTimeout(promptId, job, options = {}) {
+  if (!restartComfyOnTimeout) return;
+  if (comfyRestartInProgress) {
+    log(`ComfyUI restart already in progress after timeout for ${promptId}.`);
+    return;
+  }
+  comfyRestartInProgress = true;
+  const modeLabel = options.isVideo ? "video" : "image";
+  try {
+    await postJobProgress(job.request_id, {
+      phase: "comfyui_restarting",
+      progressLabel: "ComfyUI restarting",
+      progressText: `ComfyUI ${modeLabel} task timed out after ${formatEta(Math.round(options.timeoutMs / 1000))}. Restarting ComfyUI...`,
+      comfyPromptId: promptId
+    });
+    await restartComfyUi();
+    await postJobProgress(job.request_id, {
+      phase: "comfyui_restarted",
+      progressLabel: "ComfyUI restarted",
+      progressText: "ComfyUI was restarted after the timeout. The timed-out job will be marked failed and can be retried.",
+      comfyPromptId: promptId
+    });
+  } catch (error) {
+    log(`ComfyUI restart after timeout failed for ${promptId}: ${errorMessage(error)}`);
+    await postJobProgress(job.request_id, {
+      phase: "comfyui_restart_failed",
+      progressLabel: "ComfyUI restart failed",
+      progressText: `ComfyUI timed out, but automatic restart failed: ${errorMessage(error)}`,
+      comfyPromptId: promptId
+    });
+  } finally {
+    comfyRestartInProgress = false;
+  }
+}
+
+async function restartComfyUi() {
+  const parsed = parseComfyBaseUrl();
+  log(`Restarting ComfyUI at ${comfyBaseUrl} after timeout.`);
+  stopComfyPortListeners(parsed.port);
+  await fs.mkdir(path.join(projectRoot, "logs"), { recursive: true });
+  const child = startComfyProcess(parsed.host, parsed.port);
+  const healthy = await waitForComfyHealthy();
+  if (!healthy) {
+    throw new Error(`ComfyUI did not become healthy within ${formatEta(Math.round(comfyRestartTimeoutMs / 1000))} after restart (pid=${child.pid || "unknown"}).`);
+  }
+  log(`ComfyUI restarted at ${comfyBaseUrl} (pid=${child.pid || "unknown"}).`);
+}
+
+function parseComfyBaseUrl() {
+  try {
+    const url = new URL(comfyBaseUrl);
+    const host = url.hostname || "127.0.0.1";
+    const port = Number(url.port || (url.protocol === "https:" ? 443 : 8188));
+    return { host, port };
+  } catch {
+    return { host: "127.0.0.1", port: 8188 };
+  }
+}
+
+function stopComfyPortListeners(port) {
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error(`Invalid ComfyUI port: ${port}`);
+  }
+  if (process.platform !== "win32") {
+    throw new Error("Automatic ComfyUI restart is currently implemented for Windows workers only.");
+  }
+
+  const command = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$connections = @(Get-NetTCPConnection -LocalPort ${port} -State Listen)`,
+    "$pids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -and $_ -ne $PID })",
+    "foreach ($id in $pids) { try { Stop-Process -Id $id -Force -ErrorAction Stop } catch {} }",
+    `for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (-not (Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue)) { exit 0 } }`,
+    "exit 1"
+  ].join("; ");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+    encoding: "utf8",
+    windowsHide: true
+  });
+  if (result.status !== 0) {
+    throw new Error((result.stderr || result.stdout || `Port ${port} is still busy after stopping ComfyUI`).trim());
+  }
+}
+
+function startComfyProcess(host, port) {
+  const python = (process.env.COMFYUI_PYTHON || "python").trim();
+  if (!existsSync(comfyRoot)) {
+    throw new Error(`ComfyUI root not found: ${comfyRoot}`);
+  }
+  const stdout = openSync(path.join(projectRoot, "logs", "comfyui.out.log"), "a");
+  const stderr = openSync(path.join(projectRoot, "logs", "comfyui.err.log"), "a");
+  try {
+    const child = spawn(python, ["main.py", "--listen", host, "--port", String(port)], {
+      cwd: comfyRoot,
+      detached: true,
+      stdio: ["ignore", stdout, stderr],
+      windowsHide: true
+    });
+    child.on("error", error => {
+      log(`ComfyUI restart process failed to start: ${errorMessage(error)}`);
+    });
+    child.unref();
+    return child;
+  } finally {
+    closeSync(stdout);
+    closeSync(stderr);
+  }
+}
+
+async function waitForComfyHealthy() {
+  const deadline = Date.now() + comfyRestartTimeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(2000);
+    try {
+      const response = await fetch(`${comfyBaseUrl}/system_stats`);
+      if (response.ok) return true;
+    } catch {
+    }
+  }
+  return false;
 }
 
 function collectComfyImages(historyItem) {
